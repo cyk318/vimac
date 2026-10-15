@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+project_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$project_root"
+# 覆盖正在运行的签名二进制会让该进程的代码身份失效，权限检查也会失真。
+if pgrep -x Vimac >/dev/null; then
+    printf '%s\n' '请先从菜单退出 Vimac，再重新打包；不会覆盖正在运行的应用。' >&2
+    exit 1
+fi
+swift build -c release
+bin_dir="$(swift build -c release --show-bin-path)"
+app_dir="$project_root/dist/Vimac.app"
+mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Helpers"
+cp "$bin_dir/Vimac" "$app_dir/Contents/MacOS/Vimac"
+cp "$bin_dir/VimacFixture" "$app_dir/Contents/Helpers/VimacFixture"
+cp Resources/Info.plist "$app_dir/Contents/Info.plist"
+# 本地 ad-hoc 签名不等于 Developer ID 分发签名或公证。
+codesign --force --sign - "$app_dir/Contents/Helpers/VimacFixture"
+codesign --force --sign - "$app_dir"
+codesign --verify --strict "$app_dir"
+printf '%s\n' "$app_dir"

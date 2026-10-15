@@ -1,0 +1,234 @@
+import AppKit
+import VimCore
+
+/// 引擎、文本快照和寄存器仅由此串行队列持有。会话失效后不回放旧按键。
+public final class SessionCoordinator {
+    private let queue = DispatchQueue(label: "Vimac editing", qos: .userInteractive)
+    private let gate = NSLock()
+    private var generation = 0
+    private var pending = 0
+    private var sessionGeneration = 0
+    private var insertTransition = false
+    private var inputVersion = 0
+    private var geometryScheduled = false
+    private let provider = AccessibilityProvider()
+    private let clipboard = ClipboardBridge()
+    private let focusMonitor = FocusMonitor()
+    private let keyboard: KeyboardInterceptor
+    private var engine = VimEngine()
+    private var parser = KeyParser()
+    private var config = Configuration()
+    private var target: FocusTarget?
+    private var lastSnapshot: Snapshot?
+    private var timer: DispatchSourceTimer?
+    public var onUpdate: ((Mode, CGRect?, String, CursorStyle) -> Void)?
+    public var onFailure: ((String) -> Void)?
+
+    public init(keyboard: KeyboardInterceptor) {
+        self.keyboard = keyboard
+        // 宿主可能重复发送焦点通知，必须核对元素身份后再结束会话。
+        focusMonitor.onChange = { [weak self] in self?.queue.async { self?.refresh() } }
+        provider.canProceed = { [weak self] in
+            guard let self else { return false }
+            self.gate.lock(); defer { self.gate.unlock() }
+            return self.sessionGeneration == self.generation
+        }
+        keyboard.onKey = { [weak self] key in self?.submit { self?.handle(key) } }
+        keyboard.onToggle = { [weak self] in self?.submit { self?.toggle() } }
+        keyboard.onCancel = { [weak self] message in self?.cancel(message) }
+        keyboard.onNativeShortcut = { [weak self] in self?.cancel("系统快捷键：已退出 Vim 模式") }
+        keyboard.onScroll = { [weak self] in self?.scheduleGeometryRefresh() }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.1, repeating: 0.1)
+        timer.setEventHandler { [weak self] in self?.refresh() }
+        timer.resume()
+        self.timer = timer
+    }
+    deinit { timer?.cancel() }
+
+    public func configure(_ config: Configuration) {
+        cancel("配置已加载，Vim 模式已关闭")
+        queue.async { self.config = config; self.publish("已关闭") }
+    }
+    public func cancel(_ message: String = "已关闭") {
+        gate.lock(); generation += 1; gate.unlock()
+        // 立即放行新输入；旧队列仍会检查代数，并取消未发送的编辑动作。
+        keyboard.disableRouting()
+        queue.async { self.stop(message) }
+    }
+    private func submit(_ action: @escaping () -> Void) {
+        gate.lock()
+        if pending >= 64 { gate.unlock(); cancel("命令队列已满，已退出接管"); return }
+        pending += 1
+        let token = generation
+        gate.unlock()
+        queue.async {
+            self.gate.lock()
+            let valid = token == self.generation
+            self.pending -= 1
+            self.gate.unlock()
+            if valid { action() }
+        }
+    }
+    private func stop(_ message: String, notify: Bool = false) {
+        gate.lock(); generation += 1; gate.unlock()
+        engine.stop(); parser.reset(); target = nil; lastSnapshot = nil
+        insertTransition = false
+        focusMonitor.stop()
+        publish(message)
+        if notify { DispatchQueue.main.async { [weak self] in self?.onFailure?(message) } }
+    }
+    private func toggle() {
+        if engine.mode != .off { stop("已关闭"); return }
+        do {
+            gate.lock(); sessionGeneration = generation; gate.unlock()
+            let focus = try provider.focus()
+            let snapshot = try provider.snapshot(focus)
+            target = focus
+            if case .select(let range) = engine.begin(snapshot) { try provider.select(range, target: focus) }
+            lastSnapshot = try provider.snapshot(focus)
+            focusMonitor.start(pid: focus.pid)
+            publish("NORMAL · 当前控件支持精确选区")
+        } catch { stop(error.localizedDescription, notify: true) }
+    }
+    private func handle(_ input: KeyInput) {
+        guard let target, engine.mode != .off else { return }
+        do {
+            inputVersion += 1
+            if engine.mode == .insert && input.key != "Esc" {
+                try provider.replay(input.event, target: target)
+                finishInsertTransitionWhenIdle()
+                publish("INSERT")
+                return
+            }
+            if engine.mode == .insert && input.key == "Esc" {
+                insertTransition = false
+            }
+            let snapshot = try provider.snapshot(target)
+            if SnapshotSynchronization.mustEndSession(mode: engine.mode, previous: lastSnapshot, current: snapshot) {
+                throw ProviderError.unavailable("文本或选区由外部改变，已退出接管")
+            }
+            if engine.mode == .normal, snapshot != lastSnapshot {
+                parser.reset()
+                engine.synchronize(snapshot)
+            }
+            let command: Command?
+            if engine.mode == .insert { command = input.key == "Esc" ? .normal : nil }
+            else { command = parser.command(for: input.key, time: input.time, repeated: input.repeated, mappings: config.mappings(for: engine.mode)) }
+            guard let command else { return }
+            if engine.mode == .normal, command == .moveDown || command == .moveUp,
+               provider.isWebEditor(target) {
+                let current = try provider.moveWebLine(command, previous: snapshot, target: target)
+                engine.synchronize(current)
+                lastSnapshot = current
+                publish("NORMAL · 网页原生行移动")
+                return
+            }
+            let intent = engine.execute(command, snapshot: snapshot, register: clipboard.current())
+            try apply(intent, snapshot: snapshot, target: target)
+            if engine.mode == .insert {
+                insertTransition = true
+                finishInsertTransitionWhenIdle()
+            }
+            lastSnapshot = try provider.snapshot(target)
+            if let lastSnapshot { engine.synchronize(lastSnapshot) }
+            publish(engine.mode.rawValue.uppercased())
+        } catch { stop(error.localizedDescription, notify: true) }
+    }
+
+    private func apply(_ intent: EditIntent, snapshot: Snapshot, target: FocusTarget) throws {
+        try provider.ensure(snapshot, target: target)
+        switch intent {
+        case .none: break
+        case .select(let range): try provider.select(range, target: target)
+        case .copy(let register, let caret):
+            try clipboard.copy(register)
+            try provider.select(NSRange(location: caret, length: 0), target: target)
+        case .undo:
+            try provider.post(key: 6, flags: .maskCommand, target: target)
+            _ = try provider.awaitText(nil, previous: snapshot, target: target)
+        case .replace(let range, let text, let caret, let register):
+            let expected = (snapshot.text as NSString).replacingCharacters(in: range, with: text)
+            try provider.select(range, target: target)
+            if let register { try clipboard.copy(register) }
+            let selected = Snapshot(text: snapshot.text, selection: range)
+            try provider.ensure(selected, target: target)
+            if text.isEmpty {
+                if range.length > 0 { try provider.post(key: 51, target: target) }
+            } else {
+                let saved = try clipboard.preparePaste(text)
+                try clipboard.verify(saved)
+                try provider.ensure(selected, target: target)
+                try provider.post(key: 9, flags: .maskCommand, target: target)
+                _ = try provider.awaitText(expected, previous: snapshot, target: target)
+                clipboard.restore(saved)
+            }
+            _ = try provider.awaitText(expected, previous: snapshot, target: target)
+            let buffer = TextBuffer(expected)
+            let position = engine.mode == .insert ? min(caret, expected.utf16.count)
+                : buffer.offsets[buffer.normalPosition(buffer.index(atUTF16: caret))]
+            try provider.select(NSRange(location: position, length: 0), target: target)
+        }
+    }
+    private func refresh() {
+        guard let target, engine.mode != .off else { return }
+        do {
+            let current = try provider.snapshot(target)
+            if SnapshotSynchronization.mustEndSession(mode: engine.mode, previous: lastSnapshot, current: current) {
+                stop("文本或选区已改变，已退出接管"); return
+            }
+            if engine.mode == .normal, current != lastSnapshot {
+                parser.reset()
+                engine.synchronize(current)
+            }
+            lastSnapshot = current
+            publish(engine.mode.rawValue.uppercased())
+        } catch { stop(error.localizedDescription, notify: true) }
+    }
+    private func scheduleGeometryRefresh() {
+        queue.async { [weak self] in
+            guard let self, self.engine.mode != .off, !self.geometryScheduled else { return }
+            self.geometryScheduled = true
+            self.queue.asyncAfter(deadline: .now() + 0.016) { [weak self] in
+                guard let self else { return }
+                self.geometryScheduled = false
+                guard let target = self.target else { return }
+                do {
+                    try self.provider.verify(target)
+                    self.publish(self.engine.mode.rawValue.uppercased())
+                } catch { self.stop(error.localizedDescription, notify: true) }
+            }
+        }
+    }
+    private func finishInsertTransitionWhenIdle() {
+        let version = inputVersion
+        let session = sessionGeneration
+        // 一小段无输入间隙后才放行，防止新原生按键越过队列中正在重放的按键。
+        queue.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+            guard let self, self.engine.mode == .insert, self.sessionGeneration == session,
+                  self.inputVersion == version else { return }
+            self.gate.lock(); let empty = self.pending == 0; self.gate.unlock()
+            guard empty else { self.finishInsertTransitionWhenIdle(); return }
+            self.insertTransition = false
+            self.publish("INSERT")
+        }
+    }
+    private func publish(_ message: String) {
+        gate.lock()
+        let cancelled = engine.mode != .off && sessionGeneration != generation
+        gate.unlock()
+        if cancelled { keyboard.disableRouting(); return }
+        gate.lock()
+        let hasQueuedKeys = pending > 0
+        gate.unlock()
+        // 清空过渡期输入之前继续拦截入队，避免新输入越过尚未重放的旧输入。
+        keyboard.update(mode: engine.mode, shortcut: try! Shortcut(config.toggleKey),
+                        bufferInsert: engine.mode == .insert && (insertTransition || hasQueuedKeys))
+        let rect = target.flatMap { target in lastSnapshot.flatMap { snapshot in
+            engine.mode == .insert ? nil : provider.bounds(engine.cursorRange(in: snapshot.text), target: target)
+        } }
+        let mode = engine.mode
+        let style = config.cursor
+        DispatchQueue.main.async { [weak self] in self?.onUpdate?(mode, rect, message, style) }
+    }
+}

@@ -1,0 +1,16 @@
+{
+  "toggle_key": "ctrl+option+v",
+  "key_mapping": {
+    "normal": { "H": "moveLeft", "L": "moveRight" },
+    "visual": {}
+  },
+  "cursor": {
+    "color": "#FFFFFF",
+    "style": "block",
+    "opacity": 0.55,
+    "width": "auto",
+    "height": "auto",
+    "border_color": "#777777"
+  },
+  "theme": { "mode": "system", "accent_color": "#66CCFF" }
+}

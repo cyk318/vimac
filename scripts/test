@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+developer_dir="$(xcode-select -p)"
+frameworks="$developer_dir/Library/Developer/Frameworks"
+if [[ -d "$frameworks/Testing.framework" ]]; then
+    # 部分 CLT 安装含 Testing，但缺少 Foundation overlay 的 Modules 目录。
+    overlay_flags=()
+    if [[ ! -d "$frameworks/_Testing_Foundation.framework/Modules" ]]; then
+        overlay_flags=(-Xswiftc -Xfrontend -Xswiftc -disable-cross-import-overlays)
+    fi
+    swift test --disable-xctest -Xswiftc -F -Xswiftc "$frameworks" \
+        -Xlinker -F -Xlinker "$frameworks" -Xlinker -rpath -Xlinker "$frameworks" "${overlay_flags[@]}" "$@"
+else
+    swift test --disable-xctest "$@"
+fi
