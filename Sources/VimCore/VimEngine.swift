@@ -22,7 +22,10 @@ public struct Register: Equatable {
 public struct Snapshot: Equatable {
     public var text: String
     public var selection: NSRange
-    public init(text: String, selection: NSRange) { self.text = text; self.selection = selection }
+    public var wordBreakOffsets: Set<Int>
+    public init(text: String, selection: NSRange, wordBreakOffsets: Set<Int> = []) {
+        self.text = text; self.selection = selection; self.wordBreakOffsets = wordBreakOffsets
+    }
 }
 
 /// 适配器负责应用意图并确认宿主结果；引擎从不直接改宿主或执行 I/O。
@@ -54,7 +57,7 @@ public struct VimEngine {
         return .select(buffer.range(active, active))
     }
     public mutating func execute(_ command: Command, snapshot: Snapshot, register: Register?) -> EditIntent {
-        let buffer = TextBuffer(snapshot.text)
+        let buffer = TextBuffer(snapshot.text, wordBreakOffsets: snapshot.wordBreakOffsets)
         guard mode != .off else { return .none }
         if mode != .visual {
             active = buffer.normalPosition(buffer.index(atUTF16: snapshot.selection.location))

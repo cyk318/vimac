@@ -17,7 +17,15 @@ public struct FocusTarget {
 public final class AccessibilityProvider {
     public static let eventMarker: Int64 = 0x56494D4143
     private let system = AXUIElementCreateSystemWide()
+    private var rangeTextTarget: AXUIElement?
+    private var rangeTextReader = RangeTextReader()
+    private var loggedTextLengths: String?
+    public private(set) var hasUnmappedParagraphs = false
     public var canProceed: (() -> Bool)?
+    var diagnosticContext: [String: String] = [:]
+    func trace(_ event: String, _ fields: [String: String] = [:]) {
+        DiagnosticLog.shared.record(event, diagnosticContext.merging(fields) { _, new in new })
+    }
     public init() { AXUIElementSetMessagingTimeout(system, 0.08) }
 
     private func value(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
@@ -75,22 +83,63 @@ public final class AccessibilityProvider {
     }
     public func snapshot(_ target: FocusTarget) throws -> Snapshot {
         try verify(target)
-        guard let text = value(target.element, kAXValueAttribute) as? String,
+        guard let valueText = value(target.element, kAXValueAttribute) as? String,
               let rawRange = value(target.element, kAXSelectedTextRangeAttribute),
               CFGetTypeID(rawRange) == AXValueGetTypeID() else {
             throw ProviderError.unavailable("当前控件未提供可读取的文本与选区")
         }
-        guard text.utf16.count <= 1_000_000 else { throw ProviderError.unavailable("文本超过 100 万 UTF-16 单元，已退出接管") }
+        guard valueText.utf16.count <= 1_000_000 else { throw ProviderError.unavailable("文本超过 100 万 UTF-16 单元，已退出接管") }
+        let text: String
+        hasUnmappedParagraphs = false
+        if isWebEditor(target) {
+            if rangeTextTarget.map({ !CFEqual($0, target.element) }) ?? true {
+                rangeTextReader = RangeTextReader()
+                rangeTextTarget = target.element
+                loggedTextLengths = nil
+            }
+            text = try rangeTextReader.read(value: valueText) { length in
+                var range = CFRange(location: 0, length: length)
+                guard let parameter = AXValueCreate(.cfRange, &range) else { return .unavailable }
+                var result: CFTypeRef?
+                let error = AXUIElementCopyParameterizedAttributeValue(target.element,
+                    kAXStringForRangeParameterizedAttribute as CFString, parameter, &result)
+                if error == .illegalArgument { return .invalidRange }
+                guard error == .success, let content = result as? String else { return .unavailable }
+                return .text(content)
+            }
+            let lengths = "\(valueText.utf16.count)/\(text.utf16.count)"
+            hasUnmappedParagraphs = valueText.filter(\.isNewline).count != text.filter(\.isNewline).count
+            if lengths != loggedTextLengths {
+                trace("text.coordinates", ["source": "AXStringForRange", "value_length": String(valueText.utf16.count),
+                                           "range_length": String(text.utf16.count), "equal": String(valueText == text)])
+                loggedTextLengths = lengths
+            }
+        } else { text = valueText }
         var range = CFRange()
         guard AXValueGetValue(rawRange as! AXValue, .cfRange, &range), range.location >= 0,
               range.length >= 0, range.location <= text.utf16.count,
               range.length <= text.utf16.count - range.location else {
             throw ProviderError.unavailable("宿主返回的选区无效")
         }
-        return Snapshot(text: text, selection: NSRange(location: range.location, length: range.length))
+        var wordBreaks = Set<Int>()
+        if hasUnmappedParagraphs, valueText.filter({ !$0.isNewline }) == text {
+            var offset = 0
+            for character in valueText {
+                if character.isNewline { wordBreaks.insert(offset) }
+                else { offset += String(character).utf16.count }
+            }
+        }
+        return Snapshot(text: text, selection: NSRange(location: range.location, length: range.length),
+                        wordBreakOffsets: wordBreaks)
     }
     public func ensure(_ expected: Snapshot, target: FocusTarget) throws {
-        guard try snapshot(target) == expected else { throw ProviderError.unavailable("文本或选区已变化，请重新开启 Vim 模式") }
+        let actual = try snapshot(target)
+        guard actual == expected else {
+            trace("snapshot.mismatch", ["expected_selection": NSStringFromRange(expected.selection),
+                                        "actual_selection": NSStringFromRange(actual.selection),
+                                        "text_changed": String(actual.text != expected.text)])
+            throw ProviderError.unavailable("文本或选区已变化，请重新开启 Vim 模式")
+        }
     }
     public func isWebEditor(_ target: FocusTarget) -> Bool {
         var element = target.element
@@ -108,6 +157,7 @@ public final class AccessibilityProvider {
             throw ProviderError.unavailable("当前控件不支持网页原生行移动")
         }
         try ensure(previous, target: target)
+        trace("web.move.request", ["selection": NSStringFromRange(previous.selection)])
         try post(key: command == .moveDown ? 125 : 126, target: target)
         let deadline = ProcessInfo.processInfo.systemUptime + 0.15
         repeat {
@@ -115,33 +165,60 @@ public final class AccessibilityProvider {
             guard current.text == previous.text, current.selection.length == 0 else {
                 throw ProviderError.unavailable("行移动时正文或选区发生非预期变化，已停止")
             }
-            if current.selection != previous.selection { return current }
+            if current.selection != previous.selection {
+                trace("web.move.result", ["selection": NSStringFromRange(current.selection)])
+                return current
+            }
             Thread.sleep(forTimeInterval: 0.008)
         } while ProcessInfo.processInfo.systemUptime < deadline
         // 文档边界允许位置不变，不重复发送方向键。
-        return try snapshot(target)
+        let current = try snapshot(target)
+        trace("web.move.timeout", ["selection": NSStringFromRange(current.selection)])
+        return current
     }
     public func select(_ range: NSRange, target: FocusTarget) throws {
         try verify(target)
         // 不重复写入相同选区，避免网页编辑器把无实际变化的 AX 写入当作新选择动作。
         let previous = try snapshot(target)
-        if previous.selection == range { return }
+        if previous.selection == range {
+            trace("selection.unchanged", ["selection": NSStringFromRange(range)])
+            return
+        }
+        trace("selection.request", ["before": NSStringFromRange(previous.selection),
+                                    "requested": NSStringFromRange(range),
+                                    "utf16_count": String(previous.text.utf16.count)])
         var native = CFRange(location: range.location, length: range.length)
-        guard let value = AXValueCreate(.cfRange, &native),
-              AXUIElementSetAttributeValue(target.element, kAXSelectedTextRangeAttribute as CFString, value) == .success else {
+        guard let value = AXValueCreate(.cfRange, &native) else {
+            throw ProviderError.unavailable("无法创建请求选区")
+        }
+        let result = AXUIElementSetAttributeValue(target.element, kAXSelectedTextRangeAttribute as CFString, value)
+        trace("selection.write", ["ax_result": String(result.rawValue)])
+        guard result == .success else {
             throw ProviderError.unavailable("宿主拒绝设置选区")
         }
+        let started = ProcessInfo.processInfo.systemUptime
         let deadline = ProcessInfo.processInfo.systemUptime + 0.15
+        var observed = previous.selection
+        var attempts = 0
         repeat {
             let current = try snapshot(target)
+            observed = current.selection
+            attempts += 1
             guard current.text == previous.text else { throw ProviderError.unavailable("设置选区期间正文已改变，已停止") }
-            if current.selection == range { return }
+            if current.selection == range {
+                trace("selection.accepted", ["actual": NSStringFromRange(observed), "reads": String(attempts)])
+                return
+            }
             Thread.sleep(forTimeInterval: 0.008)
         } while ProcessInfo.processInfo.systemUptime < deadline
+        trace("selection.rejected", ["requested": NSStringFromRange(range), "actual": NSStringFromRange(observed),
+                                     "reads": String(attempts),
+                                     "elapsed_ms": String(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))])
         throw ProviderError.unavailable("宿主未采用请求选区，已停止，未继续执行编辑")
     }
     public func post(key: CGKeyCode, flags: CGEventFlags = [], target: FocusTarget) throws {
         try verify(target)
+        trace("host.key", ["key_code": String(key), "flags": String(flags.rawValue)])
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: true),
               let up = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: false) else {
             throw ProviderError.unavailable("无法创建编辑按键")

@@ -5,9 +5,11 @@ public struct TextBuffer {
     public let text: String
     public let characters: [Character]
     public let offsets: [Int]
+    private let wordBreakOffsets: Set<Int>
 
-    public init(_ text: String) {
+    public init(_ text: String, wordBreakOffsets: Set<Int> = []) {
         self.text = text
+        self.wordBreakOffsets = wordBreakOffsets
         characters = Array(text)
         var positions = [0]
         for character in characters { positions.append(positions.last! + String(character).utf16.count) }
@@ -79,18 +81,23 @@ public struct TextBuffer {
             }
         case .wordForward:
             let kind = wordClass(cursor)
-            while cursor < count && wordClass(cursor) == kind { cursor += 1 }
+            let initial = cursor
+            while cursor < count && wordClass(cursor) == kind {
+                if cursor > initial && wordBreakOffsets.contains(offsets[cursor]) { break }
+                cursor += 1
+            }
             while cursor < count && wordClass(cursor) == 0 { cursor += 1 }
         case .wordBackward:
             cursor = max(0, cursor - 1)
             while cursor > 0 && wordClass(cursor) == 0 { cursor -= 1 }
             let kind = wordClass(cursor)
-            while cursor > 0 && wordClass(cursor - 1) == kind { cursor -= 1 }
+            while cursor > 0 && wordClass(cursor - 1) == kind && !wordBreakOffsets.contains(offsets[cursor]) { cursor -= 1 }
         case .wordEnd:
             cursor = min(count, cursor + 1)
             while cursor < count && wordClass(cursor) == 0 { cursor += 1 }
             let kind = wordClass(cursor)
-            while cursor + 1 < count && wordClass(cursor + 1) == kind { cursor += 1 }
+            while cursor + 1 < count && wordClass(cursor + 1) == kind
+                && !wordBreakOffsets.contains(offsets[cursor + 1]) { cursor += 1 }
         default: break
         }
         return normalPosition(cursor)

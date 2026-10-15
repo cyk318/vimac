@@ -71,6 +71,9 @@ public final class SessionCoordinator {
         }
     }
     private func stop(_ message: String, notify: Bool = false) {
+        if engine.mode != .off || notify {
+            provider.trace("session.stop", ["mode": engine.mode.rawValue, "reason": message, "failure": String(notify)])
+        }
         gate.lock(); generation += 1; gate.unlock()
         engine.stop(); parser.reset(); target = nil; lastSnapshot = nil
         insertTransition = false
@@ -82,9 +85,15 @@ public final class SessionCoordinator {
         if engine.mode != .off { stop("已关闭"); return }
         do {
             gate.lock(); sessionGeneration = generation; gate.unlock()
+            provider.diagnosticContext = ["session": UUID().uuidString, "operation": "begin"]
             let focus = try provider.focus()
             let snapshot = try provider.snapshot(focus)
             target = focus
+            provider.diagnosticContext["pid"] = String(focus.pid)
+            provider.trace("session.begin", ["application": NSRunningApplication(processIdentifier: focus.pid)?.bundleIdentifier ?? "unknown",
+                                             "web_editor": String(provider.isWebEditor(focus)),
+                                             "selection": NSStringFromRange(snapshot.selection),
+                                             "utf16_count": String(snapshot.text.utf16.count)])
             if case .select(let range) = engine.begin(snapshot) { try provider.select(range, target: focus) }
             lastSnapshot = try provider.snapshot(focus)
             focusMonitor.start(pid: focus.pid)
@@ -95,6 +104,12 @@ public final class SessionCoordinator {
         guard let target, engine.mode != .off else { return }
         do {
             inputVersion += 1
+            provider.diagnosticContext["operation"] = String(inputVersion)
+            provider.diagnosticContext.removeValue(forKey: "command")
+            provider.trace("input.handle", ["mode": engine.mode.rawValue,
+                                             "key": engine.mode == .insert && input.key != "Esc" ? "<insert>" : input.key,
+                                             "repeated": String(input.repeated),
+                                             "queue_delay_ms": String(Int((ProcessInfo.processInfo.systemUptime - input.time) * 1000))])
             if engine.mode == .insert && input.key != "Esc" {
                 try provider.replay(input.event, target: target)
                 finishInsertTransitionWhenIdle()
@@ -105,6 +120,9 @@ public final class SessionCoordinator {
                 insertTransition = false
             }
             let snapshot = try provider.snapshot(target)
+            provider.trace("command.snapshot", ["selection": NSStringFromRange(snapshot.selection),
+                                                "utf16_count": String(snapshot.text.utf16.count),
+                                                "text_changed": String(lastSnapshot.map { $0.text != snapshot.text } ?? false)])
             if SnapshotSynchronization.mustEndSession(mode: engine.mode, previous: lastSnapshot, current: snapshot) {
                 throw ProviderError.unavailable("文本或选区由外部改变，已退出接管")
             }
@@ -116,11 +134,22 @@ public final class SessionCoordinator {
             if engine.mode == .insert { command = input.key == "Esc" ? .normal : nil }
             else { command = parser.command(for: input.key, time: input.time, repeated: input.repeated, mappings: config.mappings(for: engine.mode)) }
             guard let command else { return }
+            // 范围文本不包含网页的虚拟段落分隔符时，不能把整篇文档误当作一行编辑。
+            if provider.hasUnmappedParagraphs,
+               [.deleteLine, .yankLine, .lineStart, .lineEnd].contains(command)
+                || (command == .paste && clipboard.current()?.linewise == true) {
+                throw ProviderError.unavailable("此网页未提供可定位的段落边界，暂不支持整行操作")
+            }
+            provider.diagnosticContext["command"] = command.rawValue
+            let previousMode = engine.mode
+            provider.trace("command.begin", ["mode": previousMode.rawValue])
             if engine.mode == .normal, command == .moveDown || command == .moveUp,
                provider.isWebEditor(target) {
                 let current = try provider.moveWebLine(command, previous: snapshot, target: target)
                 engine.synchronize(current)
                 lastSnapshot = current
+                provider.trace("command.complete", ["mode": engine.mode.rawValue, "route": "native_web_line",
+                                                     "selection": NSStringFromRange(current.selection)])
                 publish("NORMAL · 网页原生行移动")
                 return
             }
@@ -132,6 +161,8 @@ public final class SessionCoordinator {
             }
             lastSnapshot = try provider.snapshot(target)
             if let lastSnapshot { engine.synchronize(lastSnapshot) }
+            provider.trace("command.complete", ["from_mode": previousMode.rawValue, "mode": engine.mode.rawValue,
+                                                 "selection": lastSnapshot.map { NSStringFromRange($0.selection) } ?? "unknown"])
             publish(engine.mode.rawValue.uppercased())
         } catch { stop(error.localizedDescription, notify: true) }
     }
@@ -151,7 +182,7 @@ public final class SessionCoordinator {
             let expected = (snapshot.text as NSString).replacingCharacters(in: range, with: text)
             try provider.select(range, target: target)
             if let register { try clipboard.copy(register) }
-            let selected = Snapshot(text: snapshot.text, selection: range)
+            let selected = Snapshot(text: snapshot.text, selection: range, wordBreakOffsets: snapshot.wordBreakOffsets)
             try provider.ensure(selected, target: target)
             if text.isEmpty {
                 if range.length > 0 { try provider.post(key: 51, target: target) }
@@ -174,6 +205,12 @@ public final class SessionCoordinator {
         guard let target, engine.mode != .off else { return }
         do {
             let current = try provider.snapshot(target)
+            if current != lastSnapshot {
+                provider.trace("host.changed", ["mode": engine.mode.rawValue,
+                                                "selection": NSStringFromRange(current.selection),
+                                                "utf16_count": String(current.text.utf16.count),
+                                                "text_changed": String(lastSnapshot.map { $0.text != current.text } ?? false)])
+            }
             if SnapshotSynchronization.mustEndSession(mode: engine.mode, previous: lastSnapshot, current: current) {
                 stop("文本或选区已改变，已退出接管"); return
             }

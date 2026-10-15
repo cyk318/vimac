@@ -24,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statePermissions = NSTextField(wrappingLabelWithString: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DiagnosticLog.shared.start()
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.autosaveName = "VimacStatus"
         status.isVisible = true
@@ -40,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(menu, "打开试验文本窗口", #selector(openFixture))
         add(menu, "重新加载配置", #selector(reloadConfig))
         add(menu, "生成 / 打开配置", #selector(openConfig))
+        add(menu, "查看运行日志", #selector(openLog))
         menu.addItem(.separator())
         add(menu, "退出 Vimac", #selector(quit))
         status.menu = menu
@@ -95,6 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setListener(_ listener: ListenerStatus, detail: String, announce: Bool = false) {
         let changed = runtime.listener != listener
+        if changed { DiagnosticLog.shared.record("listener.changed", ["status": String(describing: listener), "reason": detail]) }
         runtime.listener = listener
         runtime.detail = detail
         updateDisplay()
@@ -150,6 +153,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(item)
     }
     @objc private func stopMode() { coordinator.cancel(); renderer.hide() }
+    @objc private func openLog() {
+        DiagnosticLog.shared.flush()
+        NSWorkspace.shared.activateFileViewerSelecting([DiagnosticLog.shared.url])
+    }
     @objc private func startListening() {
         if !AXIsProcessTrusted() { requestAccessibility() }
         else if !CGPreflightListenEventAccess() && !keyboard.isListening { _ = CGRequestListenEventAccess() }
@@ -205,6 +212,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let next = FileManager.default.fileExists(atPath: configURL.path)
                 ? try Configuration.decode(Data(contentsOf: configURL)) : Configuration()
+            if !FileManager.default.fileExists(atPath: configURL.path) {
+                try FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+                try next.encoded().write(to: configURL, options: .withoutOverwriting)
+            }
             config = next
             runtime.shortcut = next.toggleKey
             coordinator.configure(next)
@@ -243,6 +255,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func quit() { NSApp.terminate(nil) }
     func applicationWillTerminate(_ notification: Notification) {
+        DiagnosticLog.shared.record("app.stop")
+        DiagnosticLog.shared.flush()
         permissionTimer?.invalidate()
         keyboard.stop()
         renderer.hide()

@@ -11,6 +11,6 @@ let package = Package(
         .executableTarget(name: "VimacApp", dependencies: ["VimCore", "MacAdapters"]),
         .executableTarget(name: "VimacFixture"),
         .executableTarget(name: "VimacProbe", dependencies: ["VimCore", "MacAdapters"]),
-        .testTarget(name: "VimCoreTests", dependencies: ["VimCore"])
+        .testTarget(name: "VimCoreTests", dependencies: ["VimCore", "MacAdapters"])
     ]
 )

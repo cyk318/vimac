@@ -121,6 +121,10 @@ public final class KeyboardInterceptor {
             return nil
         }
         if currentMode == .off { lock.unlock(); return Unmanaged.passUnretained(event) }
+        // Insert 仅记录输入发生和路由方式，不保存可还原正文的键码或字符。
+        DiagnosticLog.shared.record("input.route", ["mode": currentMode.rawValue,
+            "key": currentMode == .insert && key != "Esc" ? "<insert>" : key ?? "<unmapped>",
+            "buffered": String(bufferInsert), "repeated": String(repeated)])
         // Esc 属于 Vim 模式切换，必须同时吞掉按下/松开，不能触发网页自己的取消或选块命令。
         if key == "Esc" {
             swallowed.insert(code)
