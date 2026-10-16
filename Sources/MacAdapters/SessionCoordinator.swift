@@ -145,7 +145,7 @@ public final class SessionCoordinator {
                 guard let command else { return }
                 provider.diagnosticContext["command"] = command.rawValue
                 provider.trace("command.begin", ["mode": mode.rawValue])
-                try webSession.execute(command)
+                try webSession.execute(command, queuedFor: ProcessInfo.processInfo.systemUptime - input.time)
                 if mode == .insert {
                     insertTransition = true
                     finishInsertTransitionWhenIdle()

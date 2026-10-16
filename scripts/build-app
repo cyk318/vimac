@@ -2,14 +2,20 @@
 set -euo pipefail
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project_root"
-# 覆盖正在运行的签名二进制会让该进程的代码身份失效，权限检查也会失真。
-if pgrep -x Vimac >/dev/null; then
-    printf '%s\n' '请先从菜单退出 Vimac，再重新打包；不会覆盖正在运行的应用。' >&2
-    exit 1
+app_dir="$project_root/dist/Vimac.app"
+if [[ $# -ne 0 ]]; then
+    printf '%s\n' '用法：scripts/build-app（固定输出 dist/Vimac.app）' >&2
+    exit 2
 fi
+# 覆盖正在运行的签名二进制会让该进程的代码身份失效，权限检查也会失真。
+for process_id in $(pgrep -x Vimac || true); do
+    if [[ "$(ps -p "$process_id" -o comm=)" == "$app_dir/Contents/MacOS/Vimac" ]]; then
+        printf '%s\n' '目标应用正在运行，请先退出；不会覆盖运行中的应用。' >&2
+        exit 1
+    fi
+done
 swift build -c release
 bin_dir="$(swift build -c release --show-bin-path)"
-app_dir="$project_root/dist/Vimac.app"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Helpers"
 cp "$bin_dir/Vimac" "$app_dir/Contents/MacOS/Vimac"
 cp "$bin_dir/VimacFixture" "$app_dir/Contents/Helpers/VimacFixture"

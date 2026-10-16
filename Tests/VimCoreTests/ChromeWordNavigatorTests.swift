@@ -1,11 +1,43 @@
 import Foundation
+import JavaScriptCore
 import Testing
 import VimCore
 @testable import MacAdapters
 
 struct ChromeWordNavigatorTests {
     private func offset(_ command: Command, _ text: String, _ offset: Int) throws -> Int {
-        try ChromeWordNavigator.destination(command, block: BrowserBlock(text: text, offset: offset, path: [], url: "test"))
+        let context = JSContext()!
+        context.evaluateScript(BrowserWordScript.algorithm)
+        let value = context.objectForKeyedSubscript("wordDestination")!.call(withArguments: [text, offset, command.rawValue])
+        guard context.exception == nil, let value, !value.isUndefined else {
+            throw WordNavigationError.unavailable("invalid boundary")
+        }
+        return Int(value.toInt32())
+    }
+
+    @Test func browserAlgorithmMatchesNativeCoreAtEveryGraphemeBoundary() {
+        let context = JSContext()!
+        context.evaluateScript(BrowserWordScript.algorithm)
+        let motion = context.objectForKeyedSubscript("wordDestination")!
+        let texts = ["", "alpha beta_gamma, delta", "a 👩🏽‍💻 e\u{301} end", "中文测试 后续",
+                     "a\r\nb\n\nlast", "  \tword   ", "🇨🇳 1️⃣ #️⃣ café", "αβ ١٢٣ देवनागरी",
+                     "\u{feff}word\u{200b}word", "x\u{00a0}y\u{2028}z", "a...!!!???b", "👨‍👩‍👧‍👦💙 x"]
+        var checks = 0
+        for text in texts {
+            let buffer = TextBuffer(text)
+            for offset in buffer.offsets {
+                for command in [Command.wordForward, .wordBackward, .wordEnd] {
+                    var column: Int?
+                    let expected = offset == text.utf16.count && command != .wordBackward ? offset
+                        : buffer.offsets[buffer.move(command, from: buffer.index(atUTF16: offset), preferredColumn: &column)]
+                    let result = motion.call(withArguments: [text, offset, command.rawValue])
+                    #expect(context.exception == nil)
+                    #expect(Int(result!.toInt32()) == expected, "offset=\(offset) command=\(command)")
+                    checks += 1
+                }
+            }
+        }
+        print("Browser/native word parity checks: \(checks); no browser or UI used")
     }
 
     @Test func wordsPunctuationAndUnderscoresUseVimSemantics() throws {

@@ -52,8 +52,14 @@ final class WebNavigationSession {
         selection = current
     }
 
-    func execute(_ command: Command) throws {
+    func execute(_ command: Command, queuedFor: TimeInterval = 0) throws {
         guard mode != .off else { return }
+        // 只淘汰过期的 Normal 移动，不吞掉 Insert 输入或模式切换；防止松键后继续追赶旧光标。
+        if mode == .normal, command.isMotion, queuedFor > 0.25 {
+            message = "移动请求积压，已跳过过期移动；请重新按键"
+            trace("command.expired", ["command": command.rawValue, "queue_delay_ms": String(Int(queuedFor * 1000))])
+            return
+        }
         try verifyFocus()
         switch command {
         case .insert:

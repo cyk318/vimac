@@ -4,6 +4,21 @@ import VimCore
 @testable import MacAdapters
 
 struct WebNavigationSessionTests {
+    @Test func staleMotionDoesNotMoveButQueuedInsertStillRuns() throws {
+        var sent = 0
+        var events: [String] = []
+        let session = WebNavigationSession(readSelection: { NSRange(location: 0, length: 0) },
+            verifyFocus: {}, sendArrow: { _ in sent += 1 }, trace: { event, _ in events.append(event) },
+            moveWord: { _ in sent += 1; return true })
+        try session.begin()
+        try session.execute(.wordForward, queuedFor: 5)
+        try session.execute(.moveDown, queuedFor: 0.251)
+        #expect(sent == 0)
+        #expect(events.filter { $0 == "command.expired" }.count == 2)
+        #expect(session.mode == .normal)
+        try session.execute(.insert, queuedFor: 5)
+        #expect(session.mode == .insert)
+    }
     @Test func startsAndMovesWithoutTextOrWritableSelection() throws {
         var caret = NSRange(location: 900_000, length: 0)
         var keys: [UInt16] = []
