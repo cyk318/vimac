@@ -12,6 +12,7 @@ public enum ListenerStatus: Equatable {
 public struct RuntimeStatus {
     public var listener: ListenerStatus = .starting
     public var mode: Mode = .off
+    public var limitedNavigation = false
     public var detail = "正在启动键盘监听"
     public var shortcut = "ctrl+option+v"
     public init() {}
@@ -33,7 +34,7 @@ public struct RuntimeStatus {
         case .ready:
             switch mode {
             case .off: return "Vimac 已就绪 · 原始输入"
-            case .normal: return "NORMAL · 普通模式"
+            case .normal: return limitedNavigation ? "NORMAL · 网页有限模式" : "NORMAL · 普通模式"
             case .insert: return "INSERT · 插入模式"
             case .visual: return "VISUAL · 选择模式"
             }
@@ -50,7 +51,9 @@ public struct RuntimeStatus {
         case .ready:
             switch mode {
             case .off: return "点击文本框后按 \(shortcut) 进入 Vim；再次按此快捷键恢复原始输入。"
-            case .normal: return "h j k l 移动 · i 输入 · v 选择 · \(shortcut) 退出"
+            case .normal:
+                return limitedNavigation ? "h j k l 移动 · Chrome 块内 w b e · i 输入 · \(shortcut) 退出；选择和修改命令暂不可用"
+                    : "h j k l 移动 · i 输入 · v 选择 · \(shortcut) 退出"
             case .insert: return "正常输入文本 · Esc 返回 NORMAL"
             case .visual: return "移动扩展选区 · y 复制 · d 删除 · c 修改 · Esc 取消"
             }

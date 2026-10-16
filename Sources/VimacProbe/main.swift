@@ -5,6 +5,39 @@ import MacAdapters
 import VimCore
 
 // 此探针只操作自己启动的独立试验进程；焦点不匹配就终止。
+if CommandLine.arguments.contains("--inspect-word-capabilities") {
+    do {
+        let provider = AccessibilityProvider()
+        let target = try provider.focus()
+        let selection = try provider.selection(target)
+        print("selection=\(selection)")
+        var line: CFTypeRef?
+        let lineResult = AXUIElementCopyParameterizedAttributeValue(target.element,
+            kAXLineForIndexParameterizedAttribute as CFString, NSNumber(value: selection.location), &line)
+        print("line error=\(lineResult.rawValue) number=\((line as? NSNumber)?.intValue ?? -1)")
+        if let line {
+            var raw: CFTypeRef?
+            let result = AXUIElementCopyParameterizedAttributeValue(target.element,
+                kAXRangeForLineParameterizedAttribute as CFString, line, &raw)
+            var range = CFRange()
+            if let raw, CFGetTypeID(raw) == AXValueGetTypeID() { _ = AXValueGetValue(raw as! AXValue, .cfRange, &range) }
+            print("line range error=\(result.rawValue) range=\(range)")
+        }
+        for name in [kAXNumberOfCharactersAttribute, kAXValueAttribute] {
+            var raw: CFTypeRef?
+            let result = AXUIElementCopyAttributeValue(target.element, name as CFString, &raw)
+            print("\(name) error=\(result.rawValue) length=\((raw as? String)?.utf16.count ?? -1) number=\((raw as? NSNumber)?.intValue ?? -1)")
+        }
+        for length in [0, 1, 5, 16, 64] {
+            var range = CFRange(location: selection.location, length: length)
+            var raw: CFTypeRef?
+            let result = AXUIElementCopyParameterizedAttributeValue(target.element,
+                kAXStringForRangeParameterizedAttribute as CFString, AXValueCreate(.cfRange, &range)!, &raw)
+            print("range \(range) error=\(result.rawValue) length=\((raw as? String)?.utf16.count ?? -1)")
+        }
+        exit(0)
+    } catch { print("FAIL \(error.localizedDescription)"); exit(1) }
+}
 if CommandLine.arguments.contains("--inspect-native-motion") {
     do {
         let provider = AccessibilityProvider()
@@ -66,11 +99,12 @@ guard TISSelectInputSource(testSource) == noErr else { fatalError("无法设置�
 let keyboard = KeyboardInterceptor()
 let coordinator = SessionCoordinator(keyboard: keyboard)
 if CommandLine.arguments.contains("--verbose") {
-    coordinator.onUpdate = { mode, _, message, _ in print("STATE \(mode.rawValue): \(message)") }
+    coordinator.onUpdate = { mode, _, message, _, _ in print("STATE \(mode.rawValue): \(message)") }
 }
 if !CommandLine.arguments.contains("--external-app") { keyboard.start() }
 let fixture = Process()
 fixture.executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("VimacFixture")
+if CommandLine.arguments.contains("--web-navigation") { fixture.arguments = ["--web"] }
 try fixture.run()
 
 DispatchQueue.global(qos: .userInitiated).async {
@@ -85,6 +119,17 @@ DispatchQueue.global(qos: .userInitiated).async {
         }
         guard let target else { throw ProviderError.unavailable("未取得试验窗口焦点或权限，未操作其他应用") }
         provider.canProceed = { fixture.isRunning && NSWorkspace.shared.frontmostApplication?.processIdentifier == fixture.processIdentifier }
+        if CommandLine.arguments.contains("--web-navigation") {
+            try runWebNavigationProbe(provider: provider, target: target)
+            if fixture.isRunning { fixture.terminate() }
+            DispatchQueue.main.async {
+                keyboard.stop()
+                let currentSource = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+                if CFEqual(currentSource, testSource) { TISSelectInputSource(originalSource) }
+                exit(0)
+            }
+            return
+        }
         let original = try provider.snapshot(target)
         guard original.text.hasPrefix("Hello Vimac world!") else { throw ProviderError.unavailable("试验文本与预期不一致") }
         let range = NSRange(location: 0, length: 5)

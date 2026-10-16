@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""在明确指定且已经打开的 Chrome 标签执行验收脚本；不导航、不猜测其他标签。"""
+import argparse
+import json
+import subprocess
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--url', required=True)
+args = parser.parse_args()
+javascript = sys.stdin.read()
+
+def literal(value):
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+# 使用固定 window ID，防止重排窗口后 AppleScript 的索引引用指向另一窗口。
+source = f'''
+tell application "Google Chrome"
+    set targetWindow to 0
+    set targetTab to 0
+    repeat with w in windows
+        set n to 0
+        repeat with t in tabs of w
+            set n to n + 1
+            if URL of t is {literal(args.url)} then
+                set targetWindow to id of w
+                set targetTab to n
+                exit repeat
+            end if
+        end repeat
+        if targetWindow is not 0 then exit repeat
+    end repeat
+    if targetWindow is 0 then error "Specified test document is not open"
+    if active tab index of window id targetWindow is not targetTab then set active tab index of window id targetWindow to targetTab
+    if id of front window is not targetWindow then set index of window id targetWindow to 1
+    if frontmost is false then activate
+    delay 0.2
+    if URL of active tab of front window is not {literal(args.url)} then error "Test tab changed"
+    return execute active tab of front window javascript {literal(javascript)}
+end tell
+'''
+result = subprocess.run(['/usr/bin/osascript', '-'], input=source, text=True, capture_output=True, timeout=10)
+if result.returncode:
+    # 系统错误可能包含脚本内容，不直接回显。
+    print(json.dumps({'error': 'Chrome test script failed', 'exit_code': result.returncode}))
+    sys.exit(result.returncode)
+print(result.stdout.strip())

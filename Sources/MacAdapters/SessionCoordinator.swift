@@ -16,12 +16,14 @@ public final class SessionCoordinator {
     private let focusMonitor = FocusMonitor()
     private let keyboard: KeyboardInterceptor
     private var engine = VimEngine()
+    private var webSession: WebNavigationSession?
+    private var mode: Mode { webSession?.mode ?? engine.mode }
     private var parser = KeyParser()
     private var config = Configuration()
     private var target: FocusTarget?
     private var lastSnapshot: Snapshot?
     private var timer: DispatchSourceTimer?
-    public var onUpdate: ((Mode, CGRect?, String, CursorStyle) -> Void)?
+    public var onUpdate: ((Mode, CGRect?, String, CursorStyle, Bool) -> Void)?
     public var onFailure: ((String) -> Void)?
 
     public init(keyboard: KeyboardInterceptor) {
@@ -71,22 +73,39 @@ public final class SessionCoordinator {
         }
     }
     private func stop(_ message: String, notify: Bool = false) {
-        if engine.mode != .off || notify {
-            provider.trace("session.stop", ["mode": engine.mode.rawValue, "reason": message, "failure": String(notify)])
+        if mode != .off || notify {
+            provider.trace("session.stop", ["mode": mode.rawValue, "reason": message, "failure": String(notify)])
         }
         gate.lock(); generation += 1; gate.unlock()
-        engine.stop(); parser.reset(); target = nil; lastSnapshot = nil
+        engine.stop(); webSession = nil; parser.reset(); target = nil; lastSnapshot = nil
         insertTransition = false
         focusMonitor.stop()
         publish(message)
         if notify { DispatchQueue.main.async { [weak self] in self?.onFailure?(message) } }
     }
     private func toggle() {
-        if engine.mode != .off { stop("已关闭"); return }
+        if mode != .off { stop("已关闭"); return }
         do {
             gate.lock(); sessionGeneration = generation; gate.unlock()
             provider.diagnosticContext = ["session": UUID().uuidString, "operation": "begin"]
             let focus = try provider.focus()
+            // 首次正文读取也可能失败，必须先记录目标以便关联接管失败。
+            provider.diagnosticContext["pid"] = String(focus.pid)
+            provider.trace("session.probe", ["application": NSRunningApplication(processIdentifier: focus.pid)?.bundleIdentifier ?? "unknown"])
+            provider.traceCapabilities(focus)
+            if provider.isWebEditor(focus) {
+                // 网页接管不经过 snapshot / VimEngine，避免单一正文能力阻断整个会话。
+                provider.diagnosticContext["adapter"] = "native_navigation"
+                let session = WebNavigationSession(provider: provider, target: focus)
+                try session.begin()
+                target = focus
+                webSession = session
+                focusMonitor.start(pid: focus.pid)
+                publish(session.message)
+                return
+            }
+            provider.diagnosticContext["adapter"] = "exact_text"
+            try provider.requireWritableSelection(focus)
             let snapshot = try provider.snapshot(focus)
             target = focus
             provider.diagnosticContext["pid"] = String(focus.pid)
@@ -101,69 +120,68 @@ public final class SessionCoordinator {
         } catch { stop(error.localizedDescription, notify: true) }
     }
     private func handle(_ input: KeyInput) {
-        guard let target, engine.mode != .off else { return }
+        guard let target, mode != .off else { return }
         do {
             inputVersion += 1
             provider.diagnosticContext["operation"] = String(inputVersion)
             provider.diagnosticContext.removeValue(forKey: "command")
-            provider.trace("input.handle", ["mode": engine.mode.rawValue,
-                                             "key": engine.mode == .insert && input.key != "Esc" ? "<insert>" : input.key,
+            provider.trace("input.handle", ["mode": mode.rawValue,
+                                             "key": mode == .insert && input.key != "Esc" ? "<insert>" : input.key,
                                              "repeated": String(input.repeated),
                                              "queue_delay_ms": String(Int((ProcessInfo.processInfo.systemUptime - input.time) * 1000))])
-            if engine.mode == .insert && input.key != "Esc" {
+            if mode == .insert && input.key != "Esc" {
                 try provider.replay(input.event, target: target)
                 finishInsertTransitionWhenIdle()
                 publish("INSERT")
                 return
             }
-            if engine.mode == .insert && input.key == "Esc" {
+            if mode == .insert && input.key == "Esc" {
                 insertTransition = false
+            }
+            if let webSession {
+                let command = mode == .insert ? (input.key == "Esc" ? Command.normal : nil)
+                    : parser.command(for: input.key, time: input.time, repeated: input.repeated,
+                                     mappings: config.mappings(for: mode))
+                guard let command else { return }
+                provider.diagnosticContext["command"] = command.rawValue
+                provider.trace("command.begin", ["mode": mode.rawValue])
+                try webSession.execute(command)
+                if mode == .insert {
+                    insertTransition = true
+                    finishInsertTransitionWhenIdle()
+                }
+                publish(webSession.message)
+                return
             }
             let snapshot = try provider.snapshot(target)
             provider.trace("command.snapshot", ["selection": NSStringFromRange(snapshot.selection),
                                                 "utf16_count": String(snapshot.text.utf16.count),
                                                 "text_changed": String(lastSnapshot.map { $0.text != snapshot.text } ?? false)])
-            if SnapshotSynchronization.mustEndSession(mode: engine.mode, previous: lastSnapshot, current: snapshot) {
+            if SnapshotSynchronization.mustEndSession(mode: mode, previous: lastSnapshot, current: snapshot) {
                 throw ProviderError.unavailable("文本或选区由外部改变，已退出接管")
             }
-            if engine.mode == .normal, snapshot != lastSnapshot {
+            if mode == .normal, snapshot != lastSnapshot {
                 parser.reset()
                 engine.synchronize(snapshot)
             }
             let command: Command?
-            if engine.mode == .insert { command = input.key == "Esc" ? .normal : nil }
-            else { command = parser.command(for: input.key, time: input.time, repeated: input.repeated, mappings: config.mappings(for: engine.mode)) }
+            if mode == .insert { command = input.key == "Esc" ? .normal : nil }
+            else { command = parser.command(for: input.key, time: input.time, repeated: input.repeated, mappings: config.mappings(for: mode)) }
             guard let command else { return }
-            // 范围文本不包含网页的虚拟段落分隔符时，不能把整篇文档误当作一行编辑。
-            if provider.hasUnmappedParagraphs,
-               [.deleteLine, .yankLine, .lineStart, .lineEnd].contains(command)
-                || (command == .paste && clipboard.current()?.linewise == true) {
-                throw ProviderError.unavailable("此网页未提供可定位的段落边界，暂不支持整行操作")
-            }
             provider.diagnosticContext["command"] = command.rawValue
-            let previousMode = engine.mode
+            let previousMode = mode
             provider.trace("command.begin", ["mode": previousMode.rawValue])
-            if engine.mode == .normal, command == .moveDown || command == .moveUp,
-               provider.isWebEditor(target) {
-                let current = try provider.moveWebLine(command, previous: snapshot, target: target)
-                engine.synchronize(current)
-                lastSnapshot = current
-                provider.trace("command.complete", ["mode": engine.mode.rawValue, "route": "native_web_line",
-                                                     "selection": NSStringFromRange(current.selection)])
-                publish("NORMAL · 网页原生行移动")
-                return
-            }
             let intent = engine.execute(command, snapshot: snapshot, register: clipboard.current())
             try apply(intent, snapshot: snapshot, target: target)
-            if engine.mode == .insert {
+            if mode == .insert {
                 insertTransition = true
                 finishInsertTransitionWhenIdle()
             }
             lastSnapshot = try provider.snapshot(target)
             if let lastSnapshot { engine.synchronize(lastSnapshot) }
-            provider.trace("command.complete", ["from_mode": previousMode.rawValue, "mode": engine.mode.rawValue,
+            provider.trace("command.complete", ["from_mode": previousMode.rawValue, "mode": mode.rawValue,
                                                  "selection": lastSnapshot.map { NSStringFromRange($0.selection) } ?? "unknown"])
-            publish(engine.mode.rawValue.uppercased())
+            publish(mode.rawValue.uppercased())
         } catch { stop(error.localizedDescription, notify: true) }
     }
 
@@ -196,35 +214,40 @@ public final class SessionCoordinator {
             }
             _ = try provider.awaitText(expected, previous: snapshot, target: target)
             let buffer = TextBuffer(expected)
-            let position = engine.mode == .insert ? min(caret, expected.utf16.count)
+            let position = mode == .insert ? min(caret, expected.utf16.count)
                 : buffer.offsets[buffer.normalPosition(buffer.index(atUTF16: caret))]
             try provider.select(NSRange(location: position, length: 0), target: target)
         }
     }
     private func refresh() {
-        guard let target, engine.mode != .off else { return }
+        guard let target, mode != .off else { return }
         do {
+            if let webSession {
+                try webSession.refresh()
+                publish(webSession.message)
+                return
+            }
             let current = try provider.snapshot(target)
             if current != lastSnapshot {
-                provider.trace("host.changed", ["mode": engine.mode.rawValue,
+                provider.trace("host.changed", ["mode": mode.rawValue,
                                                 "selection": NSStringFromRange(current.selection),
                                                 "utf16_count": String(current.text.utf16.count),
                                                 "text_changed": String(lastSnapshot.map { $0.text != current.text } ?? false)])
             }
-            if SnapshotSynchronization.mustEndSession(mode: engine.mode, previous: lastSnapshot, current: current) {
+            if SnapshotSynchronization.mustEndSession(mode: mode, previous: lastSnapshot, current: current) {
                 stop("文本或选区已改变，已退出接管"); return
             }
-            if engine.mode == .normal, current != lastSnapshot {
+            if mode == .normal, current != lastSnapshot {
                 parser.reset()
                 engine.synchronize(current)
             }
             lastSnapshot = current
-            publish(engine.mode.rawValue.uppercased())
+            publish(mode.rawValue.uppercased())
         } catch { stop(error.localizedDescription, notify: true) }
     }
     private func scheduleGeometryRefresh() {
         queue.async { [weak self] in
-            guard let self, self.engine.mode != .off, !self.geometryScheduled else { return }
+            guard let self, self.mode != .off, !self.geometryScheduled else { return }
             self.geometryScheduled = true
             self.queue.asyncAfter(deadline: .now() + 0.016) { [weak self] in
                 guard let self else { return }
@@ -232,7 +255,7 @@ public final class SessionCoordinator {
                 guard let target = self.target else { return }
                 do {
                     try self.provider.verify(target)
-                    self.publish(self.engine.mode.rawValue.uppercased())
+                    self.publish(self.mode.rawValue.uppercased())
                 } catch { self.stop(error.localizedDescription, notify: true) }
             }
         }
@@ -242,7 +265,7 @@ public final class SessionCoordinator {
         let session = sessionGeneration
         // 一小段无输入间隙后才放行，防止新原生按键越过队列中正在重放的按键。
         queue.asyncAfter(deadline: .now() + 0.02) { [weak self] in
-            guard let self, self.engine.mode == .insert, self.sessionGeneration == session,
+            guard let self, self.mode == .insert, self.sessionGeneration == session,
                   self.inputVersion == version else { return }
             self.gate.lock(); let empty = self.pending == 0; self.gate.unlock()
             guard empty else { self.finishInsertTransitionWhenIdle(); return }
@@ -252,20 +275,23 @@ public final class SessionCoordinator {
     }
     private func publish(_ message: String) {
         gate.lock()
-        let cancelled = engine.mode != .off && sessionGeneration != generation
+        let cancelled = mode != .off && sessionGeneration != generation
         gate.unlock()
         if cancelled { keyboard.disableRouting(); return }
         gate.lock()
         let hasQueuedKeys = pending > 0
         gate.unlock()
         // 清空过渡期输入之前继续拦截入队，避免新输入越过尚未重放的旧输入。
-        keyboard.update(mode: engine.mode, shortcut: try! Shortcut(config.toggleKey),
-                        bufferInsert: engine.mode == .insert && (insertTransition || hasQueuedKeys))
+        keyboard.update(mode: mode, shortcut: try! Shortcut(config.toggleKey),
+                        bufferInsert: mode == .insert && (insertTransition || hasQueuedKeys))
+        // 网页没有可靠字符范围时不猜测块光标，保留宿主原生插入光标。
         let rect = target.flatMap { target in lastSnapshot.flatMap { snapshot in
-            engine.mode == .insert ? nil : provider.bounds(engine.cursorRange(in: snapshot.text), target: target)
+            mode == .insert ? nil : provider.bounds(engine.cursorRange(in: snapshot.text), target: target)
         } }
-        let mode = engine.mode
+        let currentMode = mode
+        let displayMessage = webSession?.message ?? message
+        let limitedNavigation = webSession != nil
         let style = config.cursor
-        DispatchQueue.main.async { [weak self] in self?.onUpdate?(mode, rect, message, style) }
+        DispatchQueue.main.async { [weak self] in self?.onUpdate?(currentMode, rect, displayMessage, style, limitedNavigation) }
     }
 }

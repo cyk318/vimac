@@ -45,9 +45,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         add(menu, "退出 Vimac", #selector(quit))
         status.menu = menu
-        coordinator.onUpdate = { [weak self] mode, rect, message, style in
+        coordinator.onUpdate = { [weak self] mode, rect, message, style, limitedNavigation in
             guard let self else { return }
             let oldMode = self.runtime.mode
+            self.runtime.limitedNavigation = limitedNavigation
             self.runtime.updateEditor(mode: mode, detail: message)
             self.updateDisplay()
             self.renderer.render(mode: mode, rect: rect, style: style)
@@ -134,7 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         status.button?.attributedTitle = title
         status.button?.toolTip = runtime.headline + "\n" + runtime.guidance + "\n" + runtime.detail
         status.button?.setAccessibilityLabel(runtime.menuTitle)
-        messageItem.title = runtime.headline
+        messageItem.title = runtime.limitedNavigation ? runtime.detail : runtime.headline
         permissionItem.title = "辅助功能：" + (AXIsProcessTrusted() ? "已授权" : "未授权")
             + " · 监听：" + (keyboard.isListening ? "运行中" : "未连接")
         shortcutItem.title = "开关快捷键：" + config.toggleKey

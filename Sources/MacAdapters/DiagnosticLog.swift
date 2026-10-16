@@ -29,6 +29,8 @@ public final class DiagnosticLog {
     public func start() {
         queue.async { self.enabled = true }
         record("app.start", ["version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development",
+                             "os": ProcessInfo.processInfo.operatingSystemVersionString,
+                             "diagnostic_schema": "2",
                              "pid": String(ProcessInfo.processInfo.processIdentifier),
                              "limit_bytes": String(limit)])
     }

@@ -30,7 +30,11 @@ public final class AccessibilityProvider {
 
     private func value(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
+        let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+        guard error == .success else {
+            trace("ax.attribute.failed", ["attribute": attribute, "ax_result": String(error.rawValue)])
+            return nil
+        }
         return value
     }
     public func focus() throws -> FocusTarget {
@@ -69,10 +73,49 @@ public final class AccessibilityProvider {
               explicitlyEditable == true || valueWritable.boolValue else {
             throw ProviderError.unavailable("当前控件未确认可编辑，保留原始输入")
         }
-        var writable = DarwinBoolean(false)
-        guard AXUIElementIsAttributeSettable(element, kAXSelectedTextRangeAttribute as CFString, &writable) == .success,
-              writable.boolValue else { throw ProviderError.unavailable("当前控件不支持精确选区，保留原始输入") }
         return FocusTarget(element: element, pid: pid)
+    }
+    /// 精确编辑才需要 AX 写选区；网页原生方向移动不依赖这项能力。
+    public func requireWritableSelection(_ target: FocusTarget) throws {
+        try verify(target)
+        var writable = DarwinBoolean(false)
+        let result = AXUIElementIsAttributeSettable(target.element, kAXSelectedTextRangeAttribute as CFString, &writable)
+        trace("capability.selection_write", ["ax_result": String(result.rawValue), "writable": String(writable.boolValue)])
+        guard result == .success, writable.boolValue else {
+            throw ProviderError.unavailable("当前控件不支持精确选区，保留原始输入")
+        }
+    }
+
+    /// 只记录能力元数据；声明支持的接口仍可能调用失败，不能据此启用编辑。
+    public func traceCapabilities(_ target: FocusTarget) {
+        var names: CFArray?
+        let result = AXUIElementCopyParameterizedAttributeNames(target.element, &names)
+        let parameters = names as? [String] ?? []
+        trace("capability.probe", ["role": value(target.element, kAXRoleAttribute) as? String ?? "unknown",
+            "subrole": value(target.element, kAXSubroleAttribute) as? String ?? "unknown",
+            "parameter_names_result": String(result.rawValue),
+            "advertises_range_text": String(parameters.contains(kAXStringForRangeParameterizedAttribute)),
+            "advertises_range_bounds": String(parameters.contains(kAXBoundsForRangeParameterizedAttribute)),
+            "host_version": NSRunningApplication(processIdentifier: target.pid)?.bundleURL
+                .flatMap { Bundle(url: $0)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String } ?? "unknown"])
+    }
+
+    /// 选区坐标独立读取，不用 AXValue 或 AXStringForRange 反推长度。
+    public func selection(_ target: FocusTarget) throws -> NSRange {
+        try verify(target)
+        guard let raw = value(target.element, kAXSelectedTextRangeAttribute),
+              CFGetTypeID(raw) == AXValueGetTypeID() else {
+            trace("selection.read.failed", ["reason": "missing_or_wrong_type"])
+            throw ProviderError.unavailable("当前网页未提供可读取的选区，保留原始输入")
+        }
+        var range = CFRange()
+        guard AXValueGetValue(raw as! AXValue, .cfRange, &range), range.location >= 0,
+              range.location != NSNotFound, range.length >= 0,
+              range.length <= Int.max - range.location else {
+            trace("selection.read.failed", ["reason": "invalid_range"])
+            throw ProviderError.unavailable("宿主返回的选区无效")
+        }
+        return NSRange(location: range.location, length: range.length)
     }
     public func verify(_ target: FocusTarget) throws {
         guard canProceed?() ?? true else { throw ProviderError.unavailable("会话已取消") }
@@ -83,6 +126,10 @@ public final class AccessibilityProvider {
     }
     public func snapshot(_ target: FocusTarget) throws -> Snapshot {
         try verify(target)
+        if diagnosticContext["operation"] == "begin" {
+            trace("snapshot.probe", ["role": value(target.element, kAXRoleAttribute) as? String ?? "unknown",
+                "subrole": value(target.element, kAXSubroleAttribute) as? String ?? "unknown"])
+        }
         guard let valueText = value(target.element, kAXValueAttribute) as? String,
               let rawRange = value(target.element, kAXSelectedTextRangeAttribute),
               CFGetTypeID(rawRange) == AXValueGetTypeID() else {
@@ -98,11 +145,22 @@ public final class AccessibilityProvider {
                 loggedTextLengths = nil
             }
             text = try rangeTextReader.read(value: valueText) { length in
+                let started = ProcessInfo.processInfo.systemUptime
                 var range = CFRange(location: 0, length: length)
-                guard let parameter = AXValueCreate(.cfRange, &range) else { return .unavailable }
+                guard let parameter = AXValueCreate(.cfRange, &range) else {
+                    trace("text.range.failed", ["reason": "parameter_creation", "requested_length": String(length)])
+                    return .unavailable
+                }
                 var result: CFTypeRef?
                 let error = AXUIElementCopyParameterizedAttributeValue(target.element,
                     kAXStringForRangeParameterizedAttribute as CFString, parameter, &result)
+                // 不记录正文；保留每次边界探测和真实 AX 错误，区分越界、能力缺失和通信失败。
+                trace("text.range.read", ["attribute": kAXStringForRangeParameterizedAttribute,
+                    "requested_location": "0", "requested_length": String(length),
+                    "value_length": String(valueText.utf16.count), "ax_result": String(error.rawValue),
+                    "returned_length": (result as? String).map { String($0.utf16.count) } ?? "none",
+                    "result_type": result.map { String(CFGetTypeID($0)) } ?? "none",
+                    "elapsed_ms": String(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))])
                 if error == .illegalArgument { return .invalidRange }
                 guard error == .success, let content = result as? String else { return .unavailable }
                 return .text(content)
