@@ -12,6 +12,8 @@ final class ChromeEditingSession: WebEditingSession {
     private var history = ChangeHistory()
     private var previous: State?
     private var needsRebind = false
+    private var phase = "idle"
+    private var mutationSent = false
     var mode: Mode { engine.mode }
     private(set) var message = "Chrome 精确编辑 · 当前控件/简单块"
 
@@ -24,6 +26,12 @@ final class ChromeEditingSession: WebEditingSession {
         var multiline: Bool?
         var block: Bool?
         var lineEditing: Bool?
+        var stableScope: Bool?
+        var reason: String?
+        var actualAnchor: Int?
+        var actualFocus: Int?
+        var expectedAnchor: Int?
+        var expectedFocus: Int?
         var snapshot: Snapshot {
             Snapshot(text: text!, selection: NSRange(location: min(anchor!, focus!), length: abs(anchor! - focus!)))
         }
@@ -53,6 +61,7 @@ final class ChromeEditingSession: WebEditingSession {
         previous = nil
     }
     func execute(_ request: ParsedCommand) throws {
+        phase = "snapshot"; mutationSent = false
         // Visual退出后仍保留已有的单次词移动快速通道，避免每个w/e重新传回正文。
         if mode == .normal, request.count == 1,
            [.wordForward, .wordBackward, .wordEnd, .bigWordForward, .bigWordBackward, .bigWordEnd].contains(request.command) {
@@ -137,29 +146,37 @@ final class ChromeEditingSession: WebEditingSession {
             try clipboard.copy(value)
             return after
         case .undo, .redo:
+            phase = "before_undo"
             try ensure(before)
             try provider.post(key: 6, flags: intent == .redo ? [.maskCommand, .maskShift] : .maskCommand, target: target)
+            mutationSent = true; phase = "after_undo"
             return try awaitText(nil, previous: before)
         case .replace(let range, let inserted, let caret, let value):
             let expected = (before.text! as NSString).replacingCharacters(in: range, with: inserted)
             guard expected.utf16.count <= 32768 else { throw ProviderError.unavailable("编辑后超过32K范围限制，未发送修改") }
+            phase = "select_for_edit"
             let selected = try select(range, before: before, engine: nil)
+            phase = "before_edit"
             try ensure(selected)
             var saved: ClipboardBridge.Saved?
             if inserted.isEmpty {
-                if range.length > 0 { try provider.post(key: 51, target: target) }
+                if range.length > 0 { try provider.post(key: 51, target: target); mutationSent = true }
             } else {
                 saved = try clipboard.preparePaste(inserted)
                 try clipboard.verify(saved!)
                 try ensure(selected)
                 try provider.post(key: 9, flags: .maskCommand, target: target)
+                mutationSent = true
             }
+            phase = "after_edit"
+            provider.trace("web.edit.write.sent", ["mutation_sent": String(mutationSent)])
             let edited = try awaitText(expected, previous: selected)
             if let saved { clipboard.restore(saved) }
             if let value { try clipboard.copy(value) }
             let b = TextBuffer(expected)
             let position = candidate.mode == .insert ? min(caret, expected.utf16.count)
                 : b.offsets[b.normalPosition(b.index(atUTF16: caret))]
+            phase = "restore_caret"
             return try select(NSRange(location: position, length: 0), before: edited, engine: nil)
         }
     }
@@ -176,12 +193,12 @@ final class ChromeEditingSession: WebEditingSession {
         if anchor == before.anchor && focus == before.focus { return before }
         let selected = try evaluate(["action": "select", "expected": before.text!,
             "beforeAnchor": before.anchor!, "beforeFocus": before.focus!, "anchor": anchor, "focus": focus])
-        guard selected.status == "ok" else { throw ProviderError.unavailable("网页选择失败：\(selected.status)") }
+        guard selected.status == "ok" else { throw protocolFailure(selected) }
         let deadline = ProcessInfo.processInfo.systemUptime + 0.3
         repeat {
             let state = try evaluate(["action": "confirm"])
             if state.status == "ok" { try validate(state); return state }
-            guard state.status == "pending" else { throw ProviderError.unavailable("网页选区未保持，已退出") }
+            guard state.status == "pending" else { throw protocolFailure(state) }
             Thread.sleep(forTimeInterval: 0.008)
         } while ProcessInfo.processInfo.systemUptime < deadline
         throw ProviderError.unavailable("网页选择确认超时，未重复操作")
@@ -200,13 +217,17 @@ final class ChromeEditingSession: WebEditingSession {
         guard state.status == "ok", let text = state.text, text.utf16.count <= 32768,
               let anchor = state.anchor, let focus = state.focus,
               anchor >= 0, focus >= 0, max(anchor, focus) <= text.utf16.count else {
-            throw ProviderError.unavailable("网页编辑状态不可用：\(state.status)")
+            throw protocolFailure(state)
         }
     }
     private func read() throws -> State {
         let state = try evaluate(["action": "read"])
         try validate(state)
         return state
+    }
+    private func protocolFailure(_ state: State) -> ProviderError {
+        let stage = mutationSent ? "修改已发送，结果确认失败；未重发" : "尚未发送正文修改"
+        return .unavailable("网页状态失效（\(state.reason ?? state.status)，\(phase)）；\(stage)")
     }
     private func evaluate(_ fields: [String: Any]) throws -> State {
         try provider.verify(target)
@@ -219,6 +240,18 @@ final class ChromeEditingSession: WebEditingSession {
         do { output = try AppleScriptBridge.shared.execute(script) }
         catch { throw ProviderError.unavailable("网页请求结果无法确认，已退出接管；未重发操作") }
         try provider.verify(target)
-        return try JSONDecoder().decode(State.self, from: Data(output.utf8))
+        let state = try JSONDecoder().decode(State.self, from: Data(output.utf8))
+        if state.status != "ok" && state.status != "pending" {
+            provider.trace("web.edit.protocol.rejected", ["action": fields["action"] as? String ?? "unknown",
+                "phase": phase, "status": state.status, "reason": state.reason ?? "unknown",
+                "mutation_sent": String(mutationSent), "actual_anchor": state.actualAnchor.map(String.init) ?? "unknown",
+                "actual_focus": state.actualFocus.map(String.init) ?? "unknown",
+                "expected_anchor": state.expectedAnchor.map(String.init) ?? "unknown",
+                "expected_focus": state.expectedFocus.map(String.init) ?? "unknown"])
+        } else if fields["action"] as? String == "begin" {
+            provider.trace("web.edit.scope", ["stable_scope": String(state.stableScope == true),
+                "line_editing": String(state.lineEditing == true), "utf16_count": String(state.text?.utf16.count ?? 0)])
+        }
+        return state
     }
 }

@@ -165,4 +165,85 @@ struct BrowserEditingScriptTests {
         let after = try await request(view, ["action":"read"])
         #expect(after["text"] as? String == "one\none\ntwo", "\(after)")
     }
+
+    private func slatePage() async throws -> WKWebView {
+        let view = try await page("""
+        <div id='e' data-content-editable-root contenteditable='true'>
+          <div data-block-id='before' data-block-type='heading2'><div class='ace-line'>heading</div></div>
+          <div data-block-id='a' data-block-type='text'><div data-zone-id='zone-a' data-slate-editor contenteditable='true'><div class='ace-line'>one</div></div></div>
+          <div data-block-id='b' data-block-type='text'><div data-zone-id='zone-b' data-slate-editor contenteditable='true'><div class='ace-line'>two</div></div></div>
+          <div data-block-id='after' data-block-type='bullet'><div class='ace-line'>list item</div></div>
+        </div>
+        """)
+        _ = try await view.evaluateJavaScript("""
+        window.block=id=>document.querySelector('[data-block-id="'+id+'"]');
+        window.leaf=id=>block(id).querySelector('.ace-line').firstChild;
+        getSelection().setBaseAndExtent(leaf('a'),0,leaf('a'),0);
+        """)
+        return view
+    }
+
+    @Test func slateScopeUsesOuterRootAndOnlyContiguousTextBlocks() async throws {
+        let view = try await slatePage()
+        let state = try await request(view, ["action":"begin"])
+        #expect(state["text"] as? String == "one\ntwo")
+        #expect(state["stableScope"] as? Bool == true)
+        #expect(try await view.evaluateJavaScript("document[Symbol.for('com.cyk318.vimac.editSession')].element===e") as? Bool == true)
+    }
+
+    @Test func replacedInnerZoneWithSameBlockIdsCanConfirmSelection() async throws {
+        let view = try await slatePage()
+        _ = try await request(view, ["action":"begin"])
+        _ = try await request(view, ["action":"select","expected":"one\ntwo","beforeAnchor":0,"beforeFocus":0,"anchor":0,"focus":4])
+        _ = try await view.evaluateJavaScript("""
+        const zone=block('a').firstChild;zone.replaceWith(zone.cloneNode(true));
+        getSelection().setBaseAndExtent(leaf('a'),0,leaf('b'),0);testFrame();
+        """)
+        #expect(try await request(view, ["action":"confirm"])["status"] as? String == "ok")
+    }
+
+    @Test func pasteRerenderWithNewZoneAndBlockRemainsReadable() async throws {
+        let view = try await slatePage()
+        _ = try await request(view, ["action":"begin"])
+        _ = try await view.evaluateJavaScript("""
+        const zone=block('a').firstChild;zone.replaceWith(zone.cloneNode(true));
+        block('a').firstChild.setAttribute('data-zone-id','new-zone');
+        const inserted=block('a').cloneNode(true);inserted.setAttribute('data-block-id','inserted');
+        block('b').before(inserted);getSelection().setBaseAndExtent(leaf('inserted'),0,leaf('inserted'),0);
+        """)
+        let after = try await request(view, ["action":"read"])
+        #expect(after["status"] as? String == "ok")
+        #expect(after["text"] as? String == "one\none\ntwo")
+        #expect(after["focus"] as? Int == 4)
+    }
+
+    @Test func changingBlockIdentityStillRejectsPendingDelete() async throws {
+        let view = try await slatePage()
+        _ = try await request(view, ["action":"begin"])
+        _ = try await request(view, ["action":"select","expected":"one\ntwo","beforeAnchor":0,"beforeFocus":0,"anchor":0,"focus":4])
+        _ = try await view.evaluateJavaScript("block('a').setAttribute('data-block-id','new-block');testFrame()")
+        let confirmed = try await request(view, ["action":"confirm"])
+        #expect(confirmed["status"] as? String == "stale")
+        #expect(confirmed["reason"] as? String == "line_identity_changed")
+    }
+
+    @Test func scopeBoundaryAndRootReplacementCannotRebindBySimilarText() async throws {
+        let view = try await slatePage()
+        _ = try await request(view, ["action":"begin"])
+        _ = try await view.evaluateJavaScript("block('after').setAttribute('data-block-id','new-boundary')")
+        #expect(try await request(view, ["action":"read"])["reason"] as? String == "scope_changed")
+        _ = try await view.evaluateJavaScript("e.replaceWith(e.cloneNode(true))")
+        #expect(try await request(view, ["action":"read"])["reason"] as? String == "root_detached")
+    }
+
+    @Test func hostSelectionCorrectionIsReportedWithActualOffsets() async throws {
+        let view = try await slatePage()
+        _ = try await request(view, ["action":"begin"])
+        _ = try await request(view, ["action":"select","expected":"one\ntwo","beforeAnchor":0,"beforeFocus":0,"anchor":0,"focus":4])
+        _ = try await view.evaluateJavaScript("getSelection().setBaseAndExtent(leaf('a'),0,leaf('a'),3);testFrame()")
+        let confirmed = try await request(view, ["action":"confirm"])
+        #expect(confirmed["reason"] as? String == "selection_changed")
+        #expect(confirmed["actualFocus"] as? Int == 3)
+        #expect(confirmed["expectedFocus"] as? Int == 4)
+    }
 }

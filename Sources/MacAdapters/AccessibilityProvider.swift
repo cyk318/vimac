@@ -20,6 +20,8 @@ public final class AccessibilityProvider {
     private var rangeTextTarget: AXUIElement?
     private var rangeTextReader = RangeTextReader()
     private var loggedTextLengths: String?
+    private var optionalMissSession: String?
+    private var optionalMisses = Set<String>()
     public private(set) var hasUnmappedParagraphs = false
     public var canProceed: (() -> Bool)?
     var diagnosticContext: [String: String] = [:]
@@ -28,10 +30,16 @@ public final class AccessibilityProvider {
     }
     public init() { AXUIElementSetMessagingTimeout(system, 0.08) }
 
-    private func value(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
+    private func value(_ element: AXUIElement, _ attribute: String, optional: Bool = false) -> CFTypeRef? {
         var value: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
         guard error == .success else {
+            // 可选属性缺失不是操作失败；每会话保留首条，避免10Hz焦点检查淹没真正错误。
+            if optional && (error == .noValue || error == .attributeUnsupported) {
+                let session = diagnosticContext["session"]
+                if optionalMissSession != session { optionalMissSession = session; optionalMisses.removeAll() }
+                guard optionalMisses.insert(attribute + ":" + String(error.rawValue)).inserted else { return nil }
+            }
             trace("ax.attribute.failed", ["attribute": attribute, "ax_result": String(error.rawValue)])
             return nil
         }
@@ -63,10 +71,10 @@ public final class AccessibilityProvider {
               NSWorkspace.shared.frontmostApplication?.processIdentifier == foregroundPID else {
             throw ProviderError.unavailable("输入焦点已改变")
         }
-        let subrole = value(element, kAXSubroleAttribute) as? String
+        let subrole = value(element, kAXSubroleAttribute, optional: true) as? String
         guard subrole != kAXSecureTextFieldSubrole else { throw ProviderError.unavailable("密码输入框不启用 Vim 模式") }
         var valueWritable = DarwinBoolean(false)
-        let explicitlyEditable = value(element, kAXIsEditableAttribute) as? Bool
+        let explicitlyEditable = value(element, kAXIsEditableAttribute, optional: true) as? Bool
         let enabled = value(element, kAXEnabledAttribute) as? Bool
         _ = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &valueWritable)
         guard enabled != false, explicitlyEditable != false,
