@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import WebKit
+import VimCore
 @testable import MacAdapters
 
 /// 无窗口WebKit：验证真实DOM/控件选区及身份检查，不操作用户浏览器。
@@ -79,5 +80,89 @@ struct BrowserEditingScriptTests {
         _ = try await request(view, ["action":"select","expected":"👩🏽‍💻a","beforeAnchor":0,"beforeFocus":0,"anchor":0,"focus":7])
         _ = try await view.evaluateJavaScript("e.setSelectionRange(0,0);testFrame()")
         #expect(try await request(view, ["action":"confirm"])["status"] as? String == "stale")
+    }
+
+    @Test func paragraphModelPreservesLineBreaksAndDeleteUsesHostEditing() async throws {
+        for tag in ["div", "p"] {
+            let view = try await page("<div id='e' contenteditable='true'><\(tag) class='ace-line'><b>one</b></\(tag)><\(tag) class='ace-line'>two</\(tag)><\(tag) class='ace-line'>three</\(tag)></div>")
+            _ = try await view.evaluateJavaScript("getSelection().setBaseAndExtent(e.firstChild.firstChild.firstChild,0,e.firstChild.firstChild.firstChild,0)")
+            let state = try await request(view, ["action":"begin"])
+            #expect(state["text"] as? String == "one\ntwo\nthree")
+            #expect(state["lineEditing"] as? Bool == true)
+            let snapshot = Snapshot(text: state["text"] as! String, selection: NSRange(location: 0, length: 0))
+            var engine = VimEngine(); _ = engine.begin(snapshot)
+            guard case .replace(let range, _, _, let copied) = engine.execute(.deleteLine, snapshot: snapshot, register: nil) else {
+                Issue.record("dd没有产生删除意图"); return
+            }
+            #expect(copied?.text == "one\n")
+            #expect(range == NSRange(location: 0, length: 4))
+            _ = try await request(view, ["action":"select","expected":snapshot.text,"beforeAnchor":0,"beforeFocus":0,"anchor":0,"focus":NSMaxRange(range)])
+            _ = try await view.evaluateJavaScript("testFrame()")
+            #expect(try await request(view, ["action":"confirm"])["status"] as? String == "ok")
+            _ = try await view.evaluateJavaScript("document.execCommand('delete')")
+            let after = try await request(view, ["action":"read"])
+            #expect(after["text"] as? String == "two\nthree", "\(after)")
+        }
+    }
+
+    @Test func nativeMoveThenRebindCopiesNewParagraphAndSupportsReverseSelection() async throws {
+        let view = try await page("<div id='e' contenteditable='true'><div class='ace-line'>one</div><div class='ace-line'>two</div></div>")
+        _ = try await view.evaluateJavaScript("getSelection().setBaseAndExtent(e.firstChild.firstChild,0,e.firstChild.firstChild,0)")
+        _ = try await request(view, ["action":"begin"])
+        _ = try await view.evaluateJavaScript("getSelection().setBaseAndExtent(e.lastChild.firstChild,1,e.lastChild.firstChild,1)")
+        let rebound = try await request(view, ["action":"begin"])
+        #expect(rebound["focus"] as? Int == 5)
+        let snapshot = Snapshot(text: rebound["text"] as! String, selection: NSRange(location: 5, length: 0))
+        var engine = VimEngine(); _ = engine.begin(snapshot)
+        #expect(engine.execute(.yankLine, snapshot: snapshot, register: nil) == .copy(Register(text: "two\n", linewise: true), caret: 5))
+        let selected = try await request(view, ["action":"select","expected":snapshot.text,"beforeAnchor":5,"beforeFocus":5,"anchor":7,"focus":0])
+        #expect(selected["anchor"] as? Int == 7); #expect(selected["focus"] as? Int == 0)
+    }
+
+    @Test func emptyParagraphPlaceholderAndLastLineDeletionStayRepresentable() async throws {
+        let view = try await page("<div id='e' contenteditable='true'><div>one</div><div><br></div><div>last</div></div>")
+        _ = try await view.evaluateJavaScript("getSelection().setBaseAndExtent(e.lastChild.firstChild,0,e.lastChild.firstChild,0)")
+        let state = try await request(view, ["action":"begin"])
+        #expect(state["text"] as? String == "one\n\nlast")
+        #expect(state["focus"] as? Int == 5)
+        _ = try await request(view, ["action":"select","expected":"one\n\nlast","beforeAnchor":5,"beforeFocus":5,"anchor":4,"focus":9])
+        _ = try await view.evaluateJavaScript("testFrame();document.execCommand('delete')")
+        let after = try await request(view, ["action":"read"])
+        #expect(after["text"] as? String == "one\n", "\(after)")
+    }
+
+    @Test func replacedParagraphDuringConfirmationIsStaleEvenWithSameText() async throws {
+        let view = try await page("<div id='e' contenteditable='true'><div>one</div><div>two</div></div>")
+        _ = try await view.evaluateJavaScript("getSelection().setBaseAndExtent(e.firstChild.firstChild,0,e.firstChild.firstChild,0)")
+        _ = try await request(view, ["action":"begin"])
+        _ = try await request(view, ["action":"select","expected":"one\ntwo","beforeAnchor":0,"beforeFocus":0,"anchor":0,"focus":4])
+        _ = try await view.evaluateJavaScript("e.lastChild.replaceWith(e.lastChild.cloneNode(true));getSelection().setBaseAndExtent(e.firstChild.firstChild,0,e.lastChild.firstChild,0);testFrame()")
+        #expect(try await request(view, ["action":"confirm"])["status"] as? String == "stale")
+    }
+
+    @Test func complexDocumentFallsBackWithoutPretendingItCanDeleteParagraphs() async throws {
+        let view = try await page("<div id='e' contenteditable='true'><div class='ace-line'>one</div><table><tr><td>cell</td></tr></table></div>")
+        _ = try await view.evaluateJavaScript("getSelection().setBaseAndExtent(e.firstChild.firstChild,0,e.firstChild.firstChild,0)")
+        let state = try await request(view, ["action":"begin"])
+        #expect(state["text"] as? String == "one")
+        #expect(state["lineEditing"] as? Bool == false)
+    }
+
+    @Test func yankThenLinewisePasteUsesParagraphCoordinates() async throws {
+        let view = try await page("<div id='e' contenteditable='true'><div>one</div><div>two</div></div>")
+        _ = try await view.evaluateJavaScript("getSelection().setBaseAndExtent(e.firstChild.firstChild,0,e.firstChild.firstChild,0)")
+        let state = try await request(view, ["action":"begin"])
+        let snapshot = Snapshot(text: state["text"] as! String, selection: NSRange(location: 0, length: 0))
+        var engine = VimEngine(); _ = engine.begin(snapshot)
+        guard case .copy(let copied, _) = engine.execute(.yankLine, snapshot: snapshot, register: nil),
+              case .replace(let range, let inserted, _, _) = engine.execute(.paste, snapshot: snapshot, register: copied) else {
+            Issue.record("yy/p没有产生预期意图"); return
+        }
+        #expect(copied.text == "one\n")
+        _ = try await request(view, ["action":"select","expected":snapshot.text,"beforeAnchor":0,"beforeFocus":0,"anchor":range.location,"focus":NSMaxRange(range)])
+        let argument = String(decoding: try JSONSerialization.data(withJSONObject: inserted, options: .fragmentsAllowed), as: UTF8.self)
+        _ = try await view.evaluateJavaScript("testFrame();document.execCommand('insertText',false,\(argument))")
+        let after = try await request(view, ["action":"read"])
+        #expect(after["text"] as? String == "one\none\ntwo", "\(after)")
     }
 }

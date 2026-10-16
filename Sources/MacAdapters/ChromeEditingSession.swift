@@ -3,7 +3,7 @@ import VimCore
 
 /// 精确编辑仅对当前32K以内的控件/简单块启用，AX仅用于焦点和宿主按键。
 /// 范围计算复用原生引擎；正文不会写入日志或持久化。
-final class ChromeEditingSession {
+final class ChromeEditingSession: WebEditingSession {
     private let provider: AccessibilityProvider
     private let target: FocusTarget
     private let clipboard: ClipboardBridge
@@ -11,6 +11,7 @@ final class ChromeEditingSession {
     private var engine = VimEngine()
     private var history = ChangeHistory()
     private var previous: State?
+    private var needsRebind = false
     var mode: Mode { engine.mode }
     private(set) var message = "Chrome 精确编辑 · 当前控件/简单块"
 
@@ -22,6 +23,7 @@ final class ChromeEditingSession {
         var control: Bool?
         var multiline: Bool?
         var block: Bool?
+        var lineEditing: Bool?
         var snapshot: Snapshot {
             Snapshot(text: text!, selection: NSRange(location: min(anchor!, focus!), length: abs(anchor! - focus!)))
         }
@@ -46,6 +48,10 @@ final class ChromeEditingSession {
         try provider.verify(target)
         // 不每100ms跨进程读取正文；每条命令前核实，Insert 保持宿主输入。
     }
+    func didMoveNatively() {
+        needsRebind = true
+        previous = nil
+    }
     func execute(_ request: ParsedCommand) throws {
         // Visual退出后仍保留已有的单次词移动快速通道，避免每个w/e重新传回正文。
         if mode == .normal, request.count == 1,
@@ -60,7 +66,14 @@ final class ChromeEditingSession {
                 // input/textarea走下面的控件快照；结果不明确的ProviderError不降级重发。
             }
         }
-        let before = try read()
+        let before: State
+        if needsRebind {
+            before = try evaluate(["action": "begin"])
+            try validate(before)
+            engine.synchronize(before.snapshot)
+            needsRebind = false
+            provider.trace("web.edit.rebound", ["block": String(before.block == true)])
+        } else { before = try read() }
         if mode == .visual, let previous,
            previous.snapshot != before.snapshot || previous.anchor != before.anchor || previous.focus != before.focus {
             throw ProviderError.unavailable("网页选区或正文已由外部改变，已退出接管")
@@ -78,11 +91,15 @@ final class ChromeEditingSession {
             let lineCommand = [.deleteLine, .changeLine, .openAbove, .openBelow, .joinLines].contains(request.command)
             let structural = lineCommand || engine.linewiseVisual || inserted.contains("\n") || inserted.contains("\r")
                 || (request.command == .operate && [.moveDown, .moveUp, .documentStart, .documentEnd].contains(request.motion))
-            if before.block == true && structural {
-                message = "此网页块尚不支持改段落结构；可用 v 选区及块内 d/c/p，行编辑请在 textarea 使用"; return
+            if before.block == true && structural && before.lineEditing != true {
+                message = "当前网页段落边界不完整，未执行行编辑；普通移动仍可用"
+                provider.trace("web.edit.unsupported", ["command": request.command.rawValue, "reason": "incomplete_line_boundaries"])
+                return
             }
             if before.control == true && before.multiline != true && (inserted.contains("\n") || inserted.contains("\r")) {
-                message = "单行输入框不支持换行命令"; return
+                message = "单行输入框不支持换行命令"
+                provider.trace("web.edit.unsupported", ["command": request.command.rawValue, "reason": "single_line_input"])
+                return
             }
         }
         let after = try apply(intent, before: before, candidate: candidate)
@@ -90,6 +107,17 @@ final class ChromeEditingSession {
         history.confirm(request, intent: intent, before: before.snapshot, after: after.snapshot, mode: mode, linewise: engine.linewiseVisual)
         engine.synchronize(after.snapshot)
         previous = after
+        if case .copy(let copied, _) = intent {
+            message = "已复制\(copied.linewise ? "整行" : "选区")，可按 p/P 粘贴"
+            provider.trace("web.copy.confirmed", ["command": request.command.rawValue,
+                "linewise": String(copied.linewise), "utf16_count": String(copied.text.utf16.count)])
+            return
+        }
+        if request.command.isMotion && before.snapshot == after.snapshot {
+            message = "未移动，已到当前可编辑范围边界"
+            provider.trace("web.edit.unchanged", ["command": request.command.rawValue])
+            return
+        }
         if (request.command == .undo || request.command == .redo) && before.snapshot == after.snapshot {
             message = "未观察到撤销/重做变化，可能为空栈；未重发"
             provider.trace("web.edit.unconfirmed", ["command": request.command.rawValue])

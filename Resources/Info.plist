@@ -6,8 +6,8 @@
     <key>CFBundleIdentifier</key><string>com.cyk318.vimac</string>
     <key>CFBundleName</key><string>Vimac</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.3.0</string>
-    <key>CFBundleVersion</key><string>14</string>
+    <key>CFBundleShortVersionString</key><string>0.3.1</string>
+    <key>CFBundleVersion</key><string>15</string>
     <key>NSAppleEventsUsageDescription</key><string>在 Chrome 当前输入框或简单段落中执行用户的 Vim 移动、选择与编辑命令。</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>

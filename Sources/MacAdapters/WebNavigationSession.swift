@@ -1,8 +1,16 @@
 import Foundation
 import VimCore
 
-/// 网页普通移动使用宿主方向键，词移动由独立的块内适配器处理。
-/// 两条路径均不构造 AX 全文快照，不开放正文编辑接口。
+/// 高级命令不会改变Normal方向键路由；跨段移动后精确编辑重新绑定目标。
+protocol WebEditingSession: AnyObject {
+    var mode: Mode { get }
+    var message: String { get }
+    func begin() throws
+    func refresh() throws
+    func execute(_ request: ParsedCommand) throws
+    func didMoveNatively()
+}
+
 final class WebNavigationSession {
     private let readSelection: () throws -> NSRange
     private let verifyFocus: () throws -> Void
@@ -11,20 +19,22 @@ final class WebNavigationSession {
     private let trace: (String, [String: String]) -> Void
     private var basicMode: Mode = .off
     var mode: Mode { editing?.mode ?? basicMode }
-    private var editing: ChromeEditingSession?
-    private var makeEditing: (() -> ChromeEditingSession)?
+    private var editing: WebEditingSession?
+    private var makeEditing: (() -> WebEditingSession)?
     private(set) var selection: NSRange?
     private(set) var message = "网页有限模式 · h/j/k/l 移动，i 输入；Chrome 可用块内 w/b/e"
 
     init(readSelection: @escaping () throws -> NSRange, verifyFocus: @escaping () throws -> Void,
          sendArrow: @escaping (UInt16) throws -> Void,
          trace: @escaping (String, [String: String]) -> Void,
-         moveWord: ((Command) throws -> Bool)? = nil) {
+         moveWord: ((Command) throws -> Bool)? = nil,
+         makeEditing: (() -> WebEditingSession)? = nil) {
         self.readSelection = readSelection
         self.verifyFocus = verifyFocus
         self.sendArrow = sendArrow
         self.trace = trace
         self.moveWord = moveWord
+        self.makeEditing = makeEditing
     }
 
     convenience init(provider: AccessibilityProvider, target: FocusTarget, clipboard: ClipboardBridge) {
@@ -71,6 +81,19 @@ final class WebNavigationSession {
             return
         }
         try verifyFocus()
+        if mode == .normal && [.moveLeft, .moveRight, .moveUp, .moveDown].contains(command) {
+            editing?.didMoveNatively()
+            let started = ProcessInfo.processInfo.systemUptime
+            for index in 0..<min(999, max(1, request.count)) {
+                if index > 0 && ProcessInfo.processInfo.systemUptime - started > 0.25 {
+                    message = "已移动\(index)次，剩余移动已取消以免积压"
+                    trace("web.move.count.cancelled", ["completed": String(index), "requested": String(request.count)])
+                    break
+                }
+                if try !move(command) { break }
+            }
+            return
+        }
         if let editing {
             try editing.execute(request); message = editing.message; return
         }
@@ -128,14 +151,15 @@ final class WebNavigationSession {
         return current
     }
 
-    private func move(_ command: Command) throws {
+    @discardableResult
+    private func move(_ command: Command) throws -> Bool {
         let key: UInt16
         switch command {
         case .moveLeft: key = 123
         case .moveRight: key = 124
         case .moveDown: key = 125
         case .moveUp: key = 126
-        default: return
+        default: return false
         }
         let before = try caret()
         let started = ProcessInfo.processInfo.systemUptime
@@ -150,11 +174,12 @@ final class WebNavigationSession {
                 message = "网页有限模式 · 宿主方向移动"
                 trace("web.move.observed", ["actual": NSStringFromRange(current),
                     "elapsed_ms": String(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))])
-                return
+                return true
             }
             Thread.sleep(forTimeInterval: 0.008)
         } while ProcessInfo.processInfo.systemUptime - started < 0.15
         message = "网页有限模式 · 未观察到光标移动，可能已到边界；未重复发送"
         trace("web.move.unconfirmed", ["actual": selection.map(NSStringFromRange) ?? "unknown"])
+        return false
     }
 }

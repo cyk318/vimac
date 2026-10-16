@@ -4,6 +4,54 @@ import VimCore
 @testable import MacAdapters
 
 struct WebNavigationSessionTests {
+    final class Editor: WebEditingSession {
+        var mode: Mode = .normal
+        var message = "editor"
+        var requests: [Command] = []
+        var invalidations = 0
+        func begin() throws {}
+        func refresh() throws {}
+        func didMoveNatively() { invalidations += 1 }
+        func execute(_ request: ParsedCommand) throws {
+            requests.append(request.command)
+            if request.command == .visual { mode = .visual }
+            if request.command == .normal { mode = .normal }
+        }
+    }
+    @Test func yankAndRejectedDeleteNeverCaptureNormalArrows() throws {
+        for first in [Command.yankLine, .deleteLine] {
+            let editor = Editor()
+            var caret = NSRange(location: 10, length: 0), keys: [UInt16] = []
+            let session = WebNavigationSession(readSelection: { caret }, verifyFocus: {}, sendArrow: {
+                keys.append($0); caret.location += $0 == 125 ? 10 : -10
+            }, trace: { _, _ in }, makeEditing: { editor })
+            try session.begin(); try session.execute(first)
+            try session.execute(.moveDown); try session.execute(.moveUp)
+            try session.execute(.yankLine)
+            #expect(keys == [125, 126])
+            #expect(editor.invalidations == 2)
+            #expect(editor.requests == [first, .yankLine])
+        }
+    }
+    @Test func visualUsesExactMovementThenEscapeRestoresNativeMovement() throws {
+        let editor = Editor()
+        var caret = NSRange(location: 0, length: 0), sent = 0
+        let session = WebNavigationSession(readSelection: { caret }, verifyFocus: {}, sendArrow: { _ in
+            sent += 1; caret.location += 10
+        }, trace: { _, _ in }, makeEditing: { editor })
+        try session.begin(); try session.execute(.visual); try session.execute(.moveDown)
+        #expect(sent == 0)
+        #expect(editor.requests == [.visual, .moveDown])
+        try session.execute(.normal); try session.execute(.moveDown)
+        #expect(sent == 1); #expect(editor.invalidations == 1)
+    }
+    @Test func countedNativeMovementStopsOnUnconfirmedStep() throws {
+        var sent = 0
+        let session = WebNavigationSession(readSelection: { NSRange(location: 0, length: 0) },
+            verifyFocus: {}, sendArrow: { _ in sent += 1 }, trace: { _, _ in })
+        try session.begin(); try session.execute(ParsedCommand(.moveDown, count: 5))
+        #expect(sent == 1)
+    }
     @Test func staleMotionDoesNotMoveButQueuedInsertStillRuns() throws {
         var sent = 0
         var events: [String] = []
