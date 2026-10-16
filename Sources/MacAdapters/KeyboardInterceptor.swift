@@ -123,7 +123,7 @@ public final class KeyboardInterceptor {
         if currentMode == .off { lock.unlock(); return Unmanaged.passUnretained(event) }
         // Insert 仅记录输入发生和路由方式，不保存可还原正文的键码或字符。
         DiagnosticLog.shared.record("input.route", ["mode": currentMode.rawValue,
-            "key": currentMode == .insert && key != "Esc" ? "<insert>" : key ?? "<unmapped>",
+            "key": key == "Esc" ? "Esc" : currentMode == .insert ? "<insert>" : "<command>",
             "buffered": String(bufferInsert), "repeated": String(repeated)])
         // Esc 属于 Vim 模式切换，必须同时吞掉按下/松开，不能触发网页自己的取消或选块命令。
         if key == "Esc" {
@@ -144,6 +144,12 @@ public final class KeyboardInterceptor {
             }
             lock.unlock()
             return Unmanaged.passUnretained(event)
+        }
+        if modifiers == ["ctrl"], key == "r" {
+            swallowed.insert(code)
+            lock.unlock()
+            if let copy = event.copy() { onKey?(KeyInput(key: "Ctrl+r", repeated: repeated, time: ProcessInfo.processInfo.systemUptime, event: copy)) }
+            return nil
         }
         if !modifiers.isDisjoint(with: ["cmd", "ctrl", "option"]) {
             mode = .off
@@ -168,7 +174,7 @@ public final class KeyboardInterceptor {
         let keys: [Int64: String] = [0:"a",1:"s",2:"d",3:"f",4:"h",5:"g",6:"z",7:"x",8:"c",9:"v",11:"b",
             12:"q",13:"w",14:"e",15:"r",16:"y",17:"t",18:"1",19:"2",20:"3",21:"4",22:"6",23:"5",
             24:"=",25:"9",26:"7",27:"-",28:"8",29:"0",30:"]",31:"o",32:"u",33:"[",34:"i",35:"p",
-            37:"l",38:"j",39:"'",40:"k",41:";",42:"\\",43:",",44:"/",45:"n",46:"m",47:".",50:"`",53:"Esc"]
+            36:"Return", 49:" ", 51:"Backspace", 37:"l",38:"j",39:"'",40:"k",41:";",42:"\\",43:",",44:"/",45:"n",46:"m",47:".",50:"`",53:"Esc"]
         guard let base = keys[code] else { return nil }
         if !shifted || base == "Esc" { return base }
         let shiftedKeys = ["1":"!", "2":"@", "3":"#", "4":"$", "5":"%", "6":"^", "7":"&", "8":"*", "9":"(", "0":")", "-":"_", "=":"+", "[":"{", "]":"}", ";":":", "'":"\"", ",":"<", ".":">", "/":"?", "`":"~", "\\":"|"]

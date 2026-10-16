@@ -58,10 +58,21 @@ public struct Configuration: Codable {
         "w": .wordForward, "b": .wordBackward, "e": .wordEnd,
         "0": .lineStart, "$": .lineEnd, "x": .deleteCharacter,
         "dd": .deleteLine, "yy": .yankLine, "p": .paste, "u": .undo,
-        "i": .insert, "v": .visual, "Esc": .normal
+        "i": .insert, "v": .visual, "Esc": .normal,
+        "W": .bigWordForward, "B": .bigWordBackward, "E": .bigWordEnd,
+        "^": .firstNonblank, "gg": .documentStart, "G": .documentEnd, "V": .visualLine,
+        "P": .pasteBefore, "Ctrl+r": .redo, "a": .append, "I": .insertStart, "A": .appendEnd,
+        "o": .openBelow, "O": .openAbove, "X": .deleteBackward, "s": .substitute,
+        "S": .changeLine, "cc": .changeLine, "D": .deleteToEnd, "C": .changeToEnd,
+        "Y": .yankLine, "r": .replaceCharacter, "f": .findForward, "F": .findBackward,
+        "t": .tillForward, "T": .tillBackward, ";": .repeatFind, ",": .reverseFind,
+        ".": .repeatChange, "J": .joinLines, ">>": .indent, "<<": .outdent, "~": .toggleCase,
+        "/": .searchForward, "?": .searchBackward, "n": .searchNext, "N": .searchPrevious,
+        "*": .searchWordForward, "#": .searchWordBackward
     ]
     public static let visualKeys: [String: Command] = normalKeys.filter { $0.value.isMotion }
-        .merging(["v": .visual, "Esc": .normal, "y": .yank, "d": .delete, "c": .change]) { _, new in new }
+        .merging(["v": .visual, "V": .visualLine, "Esc": .normal, "y": .yank, "d": .delete, "c": .change,
+                  ">": .indent, "<": .outdent, "~": .toggleCase, "/": .searchForward, "?": .searchBackward]) { _, new in new }
 
     public func mappings(for mode: Mode) -> [String: Command] {
         let defaults = mode == .visual ? Self.visualKeys : Self.normalKeys
@@ -120,10 +131,10 @@ public struct Configuration: Codable {
             let map = mappings(for: mode)
             let allowed = Set((mode == .normal ? Self.normalKeys : Self.visualKeys).values)
             for (key, command) in map {
-                guard allowed.contains(command), key == "Esc" || (1...2).contains(key.count) && key.allSatisfy({ $0.isASCII && !$0.isWhitespace }) else {
+                guard allowed.contains(command), key == "Esc" || key == "Ctrl+r" || (1...2).contains(key.count) && key.allSatisfy({ $0.isASCII && !$0.isWhitespace }) else {
                     throw ConfigError.invalid("key_mapping.\(mode.rawValue).\(key) 无效")
                 }
-                if key != "Esc" && map.keys.contains(where: { $0 != key && $0.hasPrefix(key) }) {
+                if key != "Esc" && key != "Ctrl+r" && map.keys.contains(where: { $0 != key && $0 != "Esc" && $0 != "Ctrl+r" && $0.hasPrefix(key) }) {
                     throw ConfigError.invalid("键位前缀冲突：\(key)")
                 }
             }
@@ -153,15 +164,91 @@ public struct Shortcut {
 public struct KeyParser {
     private var pending = ""
     private var started: TimeInterval = 0
+    private var countText = ""
+    private var operatorKey: String?
+    private var operatorCount = 1
+    private var argumentCommand: Command?
+    private var search = ""
+    public private(set) var message = ""
     public init() {}
-    public mutating func reset() { pending = "" }
+    public mutating func reset() {
+        pending = ""; countText = ""; operatorKey = nil; operatorCount = 1
+        argumentCommand = nil; search = ""; message = ""
+    }
     public mutating func command(for key: String, time: TimeInterval, repeated: Bool, mappings: [String: Command]) -> Command? {
-        if time - started > 0.8 || key == "Esc" { reset() }
-        if repeated { return mappings[key].flatMap { $0.isMotion ? $0 : nil } }
+        parse(key, time: time, repeated: repeated, mappings: mappings)?.command
+    }
+
+    /// 操作符前后计数相乘。搜索文本仅保存在内存，不进入日志。
+    public mutating func parse(_ key: String, time: TimeInterval, repeated: Bool,
+                               mappings: [String: Command]) -> ParsedCommand? {
+        if key == "Esc" { reset(); return ParsedCommand(.normal) }
+        let searching = argumentCommand == .searchForward || argumentCommand == .searchBackward
+        if !searching && time - started > 0.8 { reset() }
+        if repeated { return mappings[key].flatMap { $0.isMotion ? ParsedCommand($0) : nil } }
+        started = time
+        if let argumentCommand {
+            if searching {
+                if key == "Return" {
+                    let result = ParsedCommand(argumentCommand, argument: search)
+                    reset(); return result
+                }
+                if key == "Backspace" { if !search.isEmpty { search.removeLast() } }
+                else if key.count == 1 { search += key }
+                message = "搜索：\(search)"; return nil
+            }
+            guard key.count == 1 else { reset(); return nil }
+            let result = ParsedCommand(operatorKey == nil ? argumentCommand : .operate,
+                count: combinedCount, operation: operation, motion: argumentCommand, argument: key)
+            reset(); return result
+        }
+        if key.count == 1, key.first?.isNumber == true, key != "0" || !countText.isEmpty {
+            countText += key
+            guard let count = Int(countText), count <= 999, count * operatorCount <= 999 else {
+                reset(); message = "计数最多 999，已取消"; return nil
+            }
+            message = "等待命令"; return nil
+        }
+        if let op = operatorKey {
+            if key == op {
+                let result = ParsedCommand(op == "d" ? .deleteLine : op == "y" ? .yankLine : .changeLine, count: combinedCount)
+                reset(); return result
+            }
+            if pending == "i" || pending == "a" {
+                guard key == "w" || key == "W" else { reset(); return nil }
+                let result = ParsedCommand(.operate, count: combinedCount, operation: operation, object: pending + key)
+                reset(); return result
+            }
+            if key == "i" || key == "a" { pending = key; return nil }
+        } else if mappings["v"] == .visual && mappings["y"] == .yank && (pending == "i" || pending == "a") {
+            guard key == "w" || key == "W" else { reset(); return nil }
+            let result = ParsedCommand(.operate, count: combinedCount, object: pending + key)
+            reset(); return result
+        }
+        if operatorKey == nil && mappings[key] == nil && ["d", "y", "c"].contains(key) {
+            operatorKey = key; operatorCount = Int(countText) ?? 1; countText = ""; pending = ""
+            return nil
+        }
+        if mappings["y"] == .yank && ["i", "a"].contains(key) { pending = key; return nil }
         let sequence = pending + key
-        reset()
-        if let command = mappings[sequence] { return command }
+        pending = ""
+        if let command = mappings[sequence] {
+            if [.replaceCharacter, .findForward, .findBackward, .tillForward, .tillBackward,
+                .searchForward, .searchBackward].contains(command) {
+                argumentCommand = command
+                message = command == .searchForward || command == .searchBackward ? "搜索：" : "等待目标字符"
+                return nil
+            }
+            if operatorKey != nil && !command.isMotion { reset(); return nil }
+            let result = ParsedCommand(operatorKey == nil ? command : .operate, count: combinedCount,
+                explicitCount: !countText.isEmpty || operatorCount > 1, operation: operation, motion: command)
+            reset(); return result
+        }
         if mappings.keys.contains(where: { $0.hasPrefix(sequence) }) { pending = sequence; started = time }
+        else { reset() }
         return nil
     }
+    private var combinedCount: Int { (Int(countText) ?? 1) * operatorCount }
+    private var operation: Command? { operatorKey.map { $0 == "d" ? .delete : $0 == "y" ? .yank : .change } }
+    public var collectingText: Bool { argumentCommand != nil }
 }

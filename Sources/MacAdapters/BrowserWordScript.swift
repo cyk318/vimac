@@ -4,7 +4,9 @@ enum BrowserWordScript {
     /// 与 TextBuffer 的词分组保持一致；只借助 Intl.Segmenter 切字素，不采用浏览器的词典分词。
     static let algorithm = #"""
     function wordDestination(text, offset, command) {
-      if (!['wordForward','wordBackward','wordEnd'].includes(command)) throw Error('command');
+      if (!['wordForward','wordBackward','wordEnd','bigWordForward','bigWordBackward','bigWordEnd'].includes(command)) throw Error('command');
+      const big=command.startsWith('big');
+      if(big)command=command.replace('bigWord','word');
       if (text.length > 32768 || !Number.isInteger(offset)) throw Error('range');
       const parts=Array.from(new Intl.Segmenter('en',{granularity:'grapheme'}).segment(text));
       const chars=parts.map(p=>p.segment), offsets=parts.map(p=>p.index).concat(text.length);
@@ -12,7 +14,7 @@ enum BrowserWordScript {
       if (cursor<0) throw Error('boundary');
       if (command!=='wordBackward' && offset===text.length) return offset;
       const kind=i=>i>=chars.length?0:/^\p{White_Space}+$/u.test(chars[i])?0:
-        (/\p{L}|\p{N}/u.test(chars[i]) || chars[i]==='_')?1:2;
+        (big || /\p{L}|\p{N}/u.test(chars[i]) || chars[i]==='_')?1:2;
       if (command==='wordForward') {
         const k=kind(cursor);while(cursor<chars.length && kind(cursor)===k)cursor++;
         while(cursor<chars.length && kind(cursor)===0)cursor++;

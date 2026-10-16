@@ -17,7 +17,7 @@ final class ChromeWordNavigator {
     }
 
     func move(_ command: Command) throws -> Bool {
-        guard [.wordForward, .wordBackward, .wordEnd].contains(command) else {
+        guard [.wordForward, .wordBackward, .wordEnd, .bigWordForward, .bigWordBackward, .bigWordEnd].contains(command) else {
             throw WordNavigationError.unavailable("当前命令不是词移动")
         }
         try verifyFocus()

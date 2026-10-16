@@ -26,9 +26,9 @@ struct ChromeWordNavigatorTests {
         for text in texts {
             let buffer = TextBuffer(text)
             for offset in buffer.offsets {
-                for command in [Command.wordForward, .wordBackward, .wordEnd] {
+                for command in [Command.wordForward, .wordBackward, .wordEnd, .bigWordForward, .bigWordBackward, .bigWordEnd] {
                     var column: Int?
-                    let expected = offset == text.utf16.count && command != .wordBackward ? offset
+                    let expected = offset == text.utf16.count && command != .wordBackward && command != .bigWordBackward ? offset
                         : buffer.offsets[buffer.move(command, from: buffer.index(atUTF16: offset), preferredColumn: &column)]
                     let result = motion.call(withArguments: [text, offset, command.rawValue])
                     #expect(context.exception == nil)

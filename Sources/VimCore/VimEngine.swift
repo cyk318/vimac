@@ -6,10 +6,20 @@ public enum Command: String, Codable, CaseIterable {
     case moveLeft, moveDown, moveUp, moveRight, wordForward, wordBackward, wordEnd
     case lineStart, lineEnd, deleteCharacter, deleteLine, yankLine, paste, undo
     case insert, visual, normal, yank, delete, change
+    // 大词只按空白分隔；行选择与字符选择共用 Visual 模式。
+    case bigWordForward, bigWordBackward, bigWordEnd, firstNonblank, documentStart, documentEnd
+    case visualLine, pasteBefore, redo, append, insertStart, appendEnd, openBelow, openAbove
+    case deleteBackward, substitute, changeLine, deleteToEnd, changeToEnd, replaceCharacter
+    case operate, findForward, findBackward, tillForward, tillBackward, repeatFind, reverseFind
+    case repeatChange, joinLines, indent, outdent, toggleCase
+    case searchForward, searchBackward, searchNext, searchPrevious, searchWordForward, searchWordBackward
 
     public var isMotion: Bool {
         [.moveLeft, .moveDown, .moveUp, .moveRight, .wordForward, .wordBackward,
-         .wordEnd, .lineStart, .lineEnd].contains(self)
+         .wordEnd, .lineStart, .lineEnd, .bigWordForward, .bigWordBackward, .bigWordEnd,
+         .firstNonblank, .documentStart, .documentEnd, .findForward, .findBackward,
+         .tillForward, .tillBackward, .repeatFind, .reverseFind, .searchNext, .searchPrevious,
+         .searchWordForward, .searchWordBackward].contains(self)
     }
 }
 
@@ -34,29 +44,38 @@ public enum EditIntent: Equatable {
     case copy(Register, caret: Int)
     case replace(NSRange, String, caret: Int, register: Register?)
     case undo
+    case redo
     case none
 }
 
 public struct VimEngine {
-    public private(set) var mode: Mode = .off
-    public private(set) var active = 0
-    public private(set) var anchor: Int?
-    private var preferredColumn: Int?
+    public internal(set) var mode: Mode = .off
+    public internal(set) var active = 0
+    public internal(set) var anchor: Int?
+    var preferredColumn: Int?
+    public internal(set) var linewiseVisual = false
+    var lastFind: ParsedCommand?
+    var searchPattern = ""
+    var searchBackwards = false
+    var searchWholeWord = false
     public init() {}
 
-    public mutating func stop() { mode = .off; anchor = nil; preferredColumn = nil }
+    public mutating func stop() { mode = .off; anchor = nil; preferredColumn = nil; linewiseVisual = false }
     public mutating func synchronize(_ snapshot: Snapshot) {
         guard mode == .normal else { return }
         let buffer = TextBuffer(snapshot.text)
         active = buffer.normalPosition(buffer.index(atUTF16: snapshot.selection.location))
     }
     public mutating func begin(_ snapshot: Snapshot) -> EditIntent {
-        mode = .normal; anchor = nil; preferredColumn = nil
+        mode = .normal; anchor = nil; preferredColumn = nil; linewiseVisual = false
         let buffer = TextBuffer(snapshot.text)
         active = buffer.normalPosition(buffer.index(atUTF16: snapshot.selection.location))
         return .select(buffer.range(active, active))
     }
     public mutating func execute(_ command: Command, snapshot: Snapshot, register: Register?) -> EditIntent {
+        execute(ParsedCommand(command), snapshot: snapshot, register: register)
+    }
+    mutating func executeSingle(_ command: Command, snapshot: Snapshot, register: Register?) -> EditIntent {
         let buffer = TextBuffer(snapshot.text, wordBreakOffsets: snapshot.wordBreakOffsets)
         guard mode != .off else { return .none }
         if mode != .visual {
@@ -69,9 +88,11 @@ public struct VimEngine {
             return .select(buffer.range(active, active))
         }
         if command == .insert { mode = .insert; anchor = nil; return .none }
-        if command == .visual {
-            if mode == .visual { return execute(.normal, snapshot: snapshot, register: register) }
-            mode = .visual; anchor = active
+        if command == .visual || command == .visualLine {
+            let lines = command == .visualLine
+            if mode == .visual && linewiseVisual == lines { return execute(.normal, snapshot: snapshot, register: register) }
+            if mode != .visual { anchor = active }
+            mode = .visual; linewiseVisual = lines
             return .select(visualRange(buffer))
         }
         if command.isMotion {
@@ -81,43 +102,38 @@ public struct VimEngine {
         preferredColumn = nil
         if mode == .visual {
             let range = visualRange(buffer)
-            let copied = Register(text: buffer.substring(range))
+            var content = buffer.substring(range)
+            if linewiseVisual && content.last?.isNewline != true { content += snapshot.text.contains("\r\n") ? "\r\n" : "\n" }
+            let copied = Register(text: content, linewise: linewiseVisual)
             if command == .yank || command == .delete || command == .change {
                 mode = command == .change ? .insert : .normal
                 anchor = nil
                 active = buffer.index(atUTF16: range.location)
                 if command == .yank { return .copy(copied, caret: range.location) }
-                return .replace(range, "", caret: range.location, register: copied)
+                var deletion = range
+                // 末行无换行时删除前方分隔符；change 保留空行作为输入位置。
+                if linewiseVisual && command == .delete && NSMaxRange(range) == snapshot.text.utf16.count && range.location > 0
+                    && (range.length == 0 || !buffer.isNewline(buffer.count - 1)) {
+                    let start = buffer.index(atUTF16: range.location)
+                    deletion = buffer.range(start - 1, buffer.count)
+                }
+                let replacement = linewiseVisual && command == .change && (NSMaxRange(range) < snapshot.text.utf16.count || buffer.substring(range).last?.isNewline == true)
+                    ? (snapshot.text.contains("\r\n") ? "\r\n" : "\n") : ""
+                return .replace(deletion, replacement, caret: deletion.location, register: copied)
             }
             return .none
         }
         switch command {
-        case .deleteCharacter:
-            guard active < buffer.count && !buffer.isNewline(active) else { return .none }
-            let range = buffer.range(active, active + 1)
-            return .replace(range, "", caret: range.location, register: Register(text: buffer.substring(range)))
-        case .deleteLine, .yankLine:
-            guard buffer.count > 0 else { return .none }
-            let start = buffer.lineStart(active)
-            let end = buffer.lineEnd(active)
-            let contentRange = buffer.range(start, end < buffer.count ? end + 1 : end)
-            var content = buffer.substring(contentRange)
-            if end == buffer.count { content += "\n" }
-            let copied = Register(text: content, linewise: true)
-            if command == .yankLine { return .copy(copied, caret: buffer.offsets[active]) }
-            // 无尾换行的末行连同前方分隔符删除；寄存器仍保存行内容。
-            let deletionStart = end == buffer.count && start > 0 ? start - 1 : start
-            let range = buffer.range(deletionStart, end < buffer.count ? end + 1 : end)
-            return .replace(range, "", caret: range.location, register: copied)
-        case .paste:
+        case .paste, .pasteBefore:
             guard let register, !register.text.isEmpty else { return .none }
             if register.linewise {
                 let end = buffer.lineEnd(active)
                 let newline = buffer.text.contains("\r\n") ? "\r\n" : "\n"
                 var content = register.text
-                if !content.hasSuffix("\n") && !content.hasSuffix("\r") { content += newline }
-                let hasFollowing = end < buffer.count
-                let insertion = hasFollowing ? end + 1 : end
+                if content.last?.isNewline != true { content += newline }
+                let before = command == .pasteBefore
+                let hasFollowing = before || end < buffer.count
+                let insertion = before ? buffer.lineStart(active) : (hasFollowing ? end + 1 : end)
                 let prefix = hasFollowing || buffer.count == 0 ? "" : newline
                 if !hasFollowing && buffer.count > 0 {
                     if content.hasSuffix("\r\n") { content.removeLast() }
@@ -126,13 +142,14 @@ public struct VimEngine {
                 let range = buffer.range(insertion, insertion)
                 return .replace(range, prefix + content, caret: range.location + prefix.utf16.count, register: nil)
             }
-            let insertion = buffer.isNewline(active) ? active : min(buffer.count, active + 1)
+            let insertion = command == .pasteBefore || buffer.isNewline(active) ? active : min(buffer.count, active + 1)
             let range = buffer.range(insertion, insertion)
             let pasted = TextBuffer(register.text)
             let caret = range.location + pasted.offsets[max(0, pasted.count - 1)]
             return .replace(range, register.text, caret: caret, register: nil)
         case .undo: return .undo
-        default: return .none
+        case .redo: return .redo
+        default: return extendedEdit(command, buffer: buffer)
         }
     }
 
@@ -141,8 +158,12 @@ public struct VimEngine {
         let cursor = min(active, buffer.count)
         return buffer.range(cursor, buffer.isNewline(cursor) ? cursor : min(cursor + 1, buffer.count))
     }
-    private func visualRange(_ buffer: TextBuffer) -> NSRange {
+    func visualRange(_ buffer: TextBuffer) -> NSRange {
         let fixed = anchor ?? active
+        if linewiseVisual {
+            let end = buffer.lineEnd(max(fixed, active))
+            return buffer.range(buffer.lineStart(min(fixed, active)), end < buffer.count ? end + 1 : end)
+        }
         return buffer.range(min(fixed, active), min(buffer.count, max(fixed, active) + 1))
     }
 }

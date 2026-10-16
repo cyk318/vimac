@@ -19,6 +19,7 @@ public final class SessionCoordinator {
     private var webSession: WebNavigationSession?
     private var mode: Mode { webSession?.mode ?? engine.mode }
     private var parser = KeyParser()
+    private var history = ChangeHistory()
     private var config = Configuration()
     private var target: FocusTarget?
     private var lastSnapshot: Snapshot?
@@ -78,6 +79,7 @@ public final class SessionCoordinator {
         }
         gate.lock(); generation += 1; gate.unlock()
         engine.stop(); webSession = nil; parser.reset(); target = nil; lastSnapshot = nil
+        history.cancelPending()
         insertTransition = false
         focusMonitor.stop()
         publish(message)
@@ -96,7 +98,7 @@ public final class SessionCoordinator {
             if provider.isWebEditor(focus) {
                 // 网页接管不经过 snapshot / VimEngine，避免单一正文能力阻断整个会话。
                 provider.diagnosticContext["adapter"] = "native_navigation"
-                let session = WebNavigationSession(provider: provider, target: focus)
+                let session = WebNavigationSession(provider: provider, target: focus, clipboard: clipboard)
                 try session.begin()
                 target = focus
                 webSession = session
@@ -126,7 +128,7 @@ public final class SessionCoordinator {
             provider.diagnosticContext["operation"] = String(inputVersion)
             provider.diagnosticContext.removeValue(forKey: "command")
             provider.trace("input.handle", ["mode": mode.rawValue,
-                                             "key": mode == .insert && input.key != "Esc" ? "<insert>" : input.key,
+                                             "key": parser.collectingText || mode == .insert && input.key != "Esc" ? "<text>" : input.key,
                                              "repeated": String(input.repeated),
                                              "queue_delay_ms": String(Int((ProcessInfo.processInfo.systemUptime - input.time) * 1000))])
             if mode == .insert && input.key != "Esc" {
@@ -139,13 +141,12 @@ public final class SessionCoordinator {
                 insertTransition = false
             }
             if let webSession {
-                let command = mode == .insert ? (input.key == "Esc" ? Command.normal : nil)
-                    : parser.command(for: input.key, time: input.time, repeated: input.repeated,
-                                     mappings: config.mappings(for: mode))
-                guard let command else { return }
-                provider.diagnosticContext["command"] = command.rawValue
+                let request = mode == .insert ? (input.key == "Esc" ? ParsedCommand(.normal) : nil)
+                    : parser.parse(input.key, time: input.time, repeated: input.repeated, mappings: config.mappings(for: mode))
+                guard let request else { publish(parser.message); return }
+                provider.diagnosticContext["command"] = request.command.rawValue
                 provider.trace("command.begin", ["mode": mode.rawValue])
-                try webSession.execute(command, queuedFor: ProcessInfo.processInfo.systemUptime - input.time)
+                try webSession.execute(request, queuedFor: ProcessInfo.processInfo.systemUptime - input.time)
                 if mode == .insert {
                     insertTransition = true
                     finishInsertTransitionWhenIdle()
@@ -164,20 +165,27 @@ public final class SessionCoordinator {
                 parser.reset()
                 engine.synchronize(snapshot)
             }
-            let command: Command?
-            if mode == .insert { command = input.key == "Esc" ? .normal : nil }
-            else { command = parser.command(for: input.key, time: input.time, repeated: input.repeated, mappings: config.mappings(for: mode)) }
-            guard let command else { return }
-            provider.diagnosticContext["command"] = command.rawValue
+            let request: ParsedCommand?
+            if mode == .insert { request = input.key == "Esc" ? ParsedCommand(.normal) : nil }
+            else { request = parser.parse(input.key, time: input.time, repeated: input.repeated, mappings: config.mappings(for: mode)) }
+            guard let request else { publish(parser.message); return }
+            provider.diagnosticContext["command"] = request.command.rawValue
             let previousMode = mode
             provider.trace("command.begin", ["mode": previousMode.rawValue])
-            let intent = engine.execute(command, snapshot: snapshot, register: clipboard.current())
+            let intent: EditIntent
+            if request.command == .repeatChange {
+                guard let repeated = history.replay(engine: &engine, snapshot: snapshot, register: clipboard.current()) else {
+                    publish("没有可重复的已确认修改"); return
+                }
+                intent = repeated
+            } else { intent = engine.execute(request, snapshot: snapshot, register: clipboard.current()) }
             try apply(intent, snapshot: snapshot, target: target)
             if mode == .insert {
                 insertTransition = true
                 finishInsertTransitionWhenIdle()
             }
             lastSnapshot = try provider.snapshot(target)
+            if let lastSnapshot { history.confirm(request, intent: intent, before: snapshot, after: lastSnapshot, mode: mode, linewise: engine.linewiseVisual) }
             if let lastSnapshot { engine.synchronize(lastSnapshot) }
             provider.trace("command.complete", ["from_mode": previousMode.rawValue, "mode": mode.rawValue,
                                                  "selection": lastSnapshot.map { NSStringFromRange($0.selection) } ?? "unknown"])
@@ -193,13 +201,12 @@ public final class SessionCoordinator {
         case .copy(let register, let caret):
             try clipboard.copy(register)
             try provider.select(NSRange(location: caret, length: 0), target: target)
-        case .undo:
-            try provider.post(key: 6, flags: .maskCommand, target: target)
+        case .undo, .redo:
+            try provider.post(key: 6, flags: intent == .redo ? [.maskCommand, .maskShift] : .maskCommand, target: target)
             _ = try provider.awaitText(nil, previous: snapshot, target: target)
         case .replace(let range, let text, let caret, let register):
             let expected = (snapshot.text as NSString).replacingCharacters(in: range, with: text)
             try provider.select(range, target: target)
-            if let register { try clipboard.copy(register) }
             let selected = Snapshot(text: snapshot.text, selection: range, wordBreakOffsets: snapshot.wordBreakOffsets)
             try provider.ensure(selected, target: target)
             if text.isEmpty {
@@ -213,6 +220,7 @@ public final class SessionCoordinator {
                 clipboard.restore(saved)
             }
             _ = try provider.awaitText(expected, previous: snapshot, target: target)
+            if let register { try clipboard.copy(register) }
             let buffer = TextBuffer(expected)
             let position = mode == .insert ? min(caret, expected.utf16.count)
                 : buffer.offsets[buffer.normalPosition(buffer.index(atUTF16: caret))]
@@ -289,7 +297,7 @@ public final class SessionCoordinator {
             mode == .insert ? nil : provider.bounds(engine.cursorRange(in: snapshot.text), target: target)
         } }
         let currentMode = mode
-        let displayMessage = webSession?.message ?? message
+        let displayMessage = parser.message.isEmpty ? (webSession?.message ?? message) : parser.message
         let limitedNavigation = webSession != nil
         let style = config.cursor
         DispatchQueue.main.async { [weak self] in self?.onUpdate?(currentMode, rect, displayMessage, style, limitedNavigation) }

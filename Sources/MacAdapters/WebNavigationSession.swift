@@ -9,7 +9,10 @@ final class WebNavigationSession {
     private let sendArrow: (UInt16) throws -> Void
     private let moveWord: ((Command) throws -> Bool)?
     private let trace: (String, [String: String]) -> Void
-    private(set) var mode: Mode = .off
+    private var basicMode: Mode = .off
+    var mode: Mode { editing?.mode ?? basicMode }
+    private var editing: ChromeEditingSession?
+    private var makeEditing: (() -> ChromeEditingSession)?
     private(set) var selection: NSRange?
     private(set) var message = "网页有限模式 · h/j/k/l 移动，i 输入；Chrome 可用块内 w/b/e"
 
@@ -24,25 +27,27 @@ final class WebNavigationSession {
         self.moveWord = moveWord
     }
 
-    convenience init(provider: AccessibilityProvider, target: FocusTarget) {
+    convenience init(provider: AccessibilityProvider, target: FocusTarget, clipboard: ClipboardBridge) {
         let words = ChromeWordNavigator(verifyFocus: { try provider.verify(target) },
                                        trace: { provider.trace($0, $1) })
         self.init(readSelection: { try provider.selection(target) },
                   verifyFocus: { try provider.verify(target) },
                   sendArrow: { try provider.post(key: $0, target: target) },
                   trace: { provider.trace($0, $1) }, moveWord: { try words.move($0) })
+        makeEditing = { ChromeEditingSession(provider: provider, target: target, clipboard: clipboard) }
     }
 
     func begin() throws {
         try verifyFocus()
         selection = try caret()
-        mode = .normal
+        basicMode = .normal
         trace("web.session.begin", ["adapter": "native_navigation", "full_text_required": "false",
             "selection": NSStringFromRange(selection!), "commands": "h,j,k,l,i,Esc;Chrome:block-w,b,e"])
     }
 
     /// Normal 不持有自算偏移；宿主异步更新后继续以真实插入位置为准。
     func refresh() throws {
+        if let editing { try editing.refresh(); return }
         try verifyFocus()
         guard mode == .normal else { return }
         let current = try caret()
@@ -53,6 +58,11 @@ final class WebNavigationSession {
     }
 
     func execute(_ command: Command, queuedFor: TimeInterval = 0) throws {
+        try execute(ParsedCommand(command), queuedFor: queuedFor)
+    }
+
+    func execute(_ request: ParsedCommand, queuedFor: TimeInterval = 0) throws {
+        let command = request.command
         guard mode != .off else { return }
         // 只淘汰过期的 Normal 移动，不吞掉 Insert 输入或模式切换；防止松键后继续追赶旧光标。
         if mode == .normal, command.isMotion, queuedFor > 0.25 {
@@ -61,27 +71,47 @@ final class WebNavigationSession {
             return
         }
         try verifyFocus()
+        if let editing {
+            try editing.execute(request); message = editing.message; return
+        }
+        let basic: [Command] = [.insert, .normal, .moveLeft, .moveRight, .moveUp, .moveDown,
+                                .wordForward, .wordBackward, .wordEnd, .bigWordForward, .bigWordBackward, .bigWordEnd]
+        if (!basic.contains(command) || request.count != 1), let makeEditing {
+            let session = makeEditing()
+            do { try session.begin() }
+            catch WordNavigationError.unavailable(let reason) { message = reason; return }
+            try session.execute(request)
+            editing = session; message = session.message; return
+        }
         switch command {
         case .insert:
             selection = try caret()
-            mode = .insert
+            basicMode = .insert
             message = "网页有限模式 · INSERT，Esc 返回移动模式"
             trace("web.mode.changed", ["mode": mode.rawValue])
         case .normal:
             selection = try caret()
-            mode = .normal
+            basicMode = .normal
             message = "网页有限模式 · h/j/k/l 移动，Chrome 块内 w/b/e，i 输入"
             trace("web.mode.changed", ["mode": mode.rawValue])
         case .moveLeft, .moveDown, .moveUp, .moveRight:
             if mode == .normal { try move(command) }
-        case .wordForward where moveWord != nil, .wordBackward where moveWord != nil, .wordEnd where moveWord != nil:
+        case .wordForward where moveWord != nil, .wordBackward where moveWord != nil, .wordEnd where moveWord != nil,
+             .bigWordForward where moveWord != nil, .bigWordBackward where moveWord != nil, .bigWordEnd where moveWord != nil:
             guard mode == .normal, let moveWord else { return }
             do {
                 let moved = try moveWord(command)
                 selection = try caret()
                 message = moved ? "网页有限模式 · 当前编辑块内词移动" : "已到当前编辑块边界；跨块请使用 h/j/k/l"
             } catch WordNavigationError.unavailable(let reason) {
-                message = reason
+                // input/textarea没有DOM文本选区，转用同一引擎的控件适配。
+                if let makeEditing {
+                    let session = makeEditing()
+                    do {
+                        try session.begin(); try session.execute(request)
+                        editing = session; message = session.message
+                    } catch WordNavigationError.unavailable(let detail) { message = detail }
+                } else { message = reason }
                 trace("web.word.unavailable", ["reason": reason])
             }
         default:

@@ -52,19 +52,25 @@ public struct TextBuffer {
     public func substring(_ range: NSRange) -> String {
         (text as NSString).substring(with: range)
     }
-    private func wordClass(_ index: Int) -> Int {
+    func wordClass(_ index: Int, big: Bool = false) -> Int {
         guard index < count else { return 0 }
         let character = characters[index]
         if character.isWhitespace { return 0 }
+        if big { return 1 }
         if character.isLetter || character.isNumber || character == "_" { return 1 }
         return 2
     }
-    public func move(_ command: Command, from index: Int, preferredColumn: inout Int?) -> Int {
+    public func move(_ command: Command, from index: Int, preferredColumn: inout Int?, normalize: Bool = true) -> Int {
         var cursor = min(max(0, index), count)
         let start = lineStart(cursor)
         let end = lineEnd(cursor)
         if command != .moveUp && command != .moveDown { preferredColumn = nil }
         switch command {
+        case .firstNonblank:
+            cursor = start
+            while cursor < end && characters[cursor].isWhitespace { cursor += 1 }
+        case .documentStart: cursor = 0
+        case .documentEnd: cursor = lineStart(count)
         case .moveLeft: cursor = max(start, cursor - 1)
         case .moveRight: cursor = min(max(start, end - 1), cursor + 1)
         case .lineStart: cursor = start
@@ -79,27 +85,30 @@ public struct TextBuffer {
                 let next = end + 1
                 cursor = min(next + column, max(next, lineEnd(next) - 1))
             }
-        case .wordForward:
-            let kind = wordClass(cursor)
+        case .wordForward, .bigWordForward:
+            let big = command == .bigWordForward
+            let kind = wordClass(cursor, big: big)
             let initial = cursor
-            while cursor < count && wordClass(cursor) == kind {
+            while cursor < count && wordClass(cursor, big: big) == kind {
                 if cursor > initial && wordBreakOffsets.contains(offsets[cursor]) { break }
                 cursor += 1
             }
             while cursor < count && wordClass(cursor) == 0 { cursor += 1 }
-        case .wordBackward:
+        case .wordBackward, .bigWordBackward:
             cursor = max(0, cursor - 1)
             while cursor > 0 && wordClass(cursor) == 0 { cursor -= 1 }
-            let kind = wordClass(cursor)
-            while cursor > 0 && wordClass(cursor - 1) == kind && !wordBreakOffsets.contains(offsets[cursor]) { cursor -= 1 }
-        case .wordEnd:
+            let big = command == .bigWordBackward
+            let kind = wordClass(cursor, big: big)
+            while cursor > 0 && wordClass(cursor - 1, big: big) == kind && !wordBreakOffsets.contains(offsets[cursor]) { cursor -= 1 }
+        case .wordEnd, .bigWordEnd:
             cursor = min(count, cursor + 1)
             while cursor < count && wordClass(cursor) == 0 { cursor += 1 }
-            let kind = wordClass(cursor)
-            while cursor + 1 < count && wordClass(cursor + 1) == kind
+            let big = command == .bigWordEnd
+            let kind = wordClass(cursor, big: big)
+            while cursor + 1 < count && wordClass(cursor + 1, big: big) == kind
                 && !wordBreakOffsets.contains(offsets[cursor + 1]) { cursor += 1 }
         default: break
         }
-        return normalPosition(cursor)
+        return normalize ? normalPosition(cursor) : cursor
     }
 }
